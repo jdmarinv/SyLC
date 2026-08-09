@@ -498,7 +498,7 @@ class WindowPresentationMixin:
             # Method 2: Force video output reconfiguration
             try:
                 self.player.command('vo-cmdline', 'd3d11-exclusive-fs=no')
-            except:
+            except Exception:
                 pass
             
             # Method 3: Re-apply HDR settings

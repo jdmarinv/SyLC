@@ -836,15 +836,23 @@ class NativeFramepackWidget(QWidget):
                         if frame is None:
                             ok = setter(None)
                         else:
-                            # Three confidence regimes: full alpha-aware
-                            # reconstruction only for a well-registered matte,
-                            # conservative guard for an uncertain-but-useful
-                            # projection, and None upstream below the rejection
-                            # threshold.  A marginal tracker can therefore
-                            # never perform the most visible contour rewrite.
-                            confidence = float(getattr(
-                                frame, 'tracking_confidence', 1.0))
-                            mode = 'contour' if confidence >= 0.68 else 'guard'
+                            # Three regimes: full alpha-aware reconstruction
+                            # only for a well-registered matte, conservative
+                            # guard for an uncertain-but-useful projection, and
+                            # None upstream below the rejection threshold.  A
+                            # marginal tracker can therefore never perform the
+                            # most visible contour rewrite.
+                            #
+                            # The promotion is decided by the transport, which
+                            # owns both the evidence and the age policy, and
+                            # arrives as a boolean.  Re-thresholding a score
+                            # here would put half of one decision in a module
+                            # that cannot see why the score has the value it
+                            # has.  Default True: a service that predates the
+                            # flag only ever delivered fresh network mattes.
+                            mode = ('contour'
+                                    if getattr(frame, 'allow_contour', True)
+                                    else 'guard')
                             reliability = getattr(frame, 'reliability', None)
                             try:
                                 ok = setter(frame.alpha, mode, reliability)

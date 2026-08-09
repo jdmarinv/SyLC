@@ -20,6 +20,7 @@
                                 // compiled under BUILD_NATIVE_RENDERER (see CMakeLists.txt);
                                 // usage below stays inside #ifdef SYLC_NATIVE_RENDERER
 #include "depth_stabilizer.h"  // same gating as depth_engine.h above
+#include "synth3d_temporal_filter.h"
 #include "cut_gate.h"          // header-only; same gating as depth_engine.h above
 #include "shared_depth_service.h"  // synth3d_flow::estimate_flow test surface
 #ifdef SYLC_NATIVE_RENDERER
@@ -1516,13 +1517,25 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                      std::memcpy(out.mutable_data(), buf.data(), buf.size());
                      return std::move(out);
                  }
+                 if (bpp == 4) {
+                     py::array_t<uint32_t> out({sh, sw});
+                     std::memcpy(out.mutable_data(), buf.data(), buf.size());
+                     return std::move(out);
+                 }
+                 if (bpp == 8) {
+                     py::array_t<uint16_t> out(
+                         {sh, sw, static_cast<py::ssize_t>(4)});
+                     std::memcpy(out.mutable_data(), buf.data(), buf.size());
+                     return std::move(out);
+                 }
                  py::array_t<uint8_t> out({sh, sw});
                  std::memcpy(out.mutable_data(), buf.data(), buf.size());
                  return std::move(out);
              },
              py::arg("slot"),
-             "Debug: read back one synth3d warp output (slot 0..5 = Y_L,U_L,V_L,Y_R,U_R,"
-             "V_R) as a 2-D numpy array (uint8 for R8 planes, uint16 for R16).")
+             "Debug: read back one synth3d output (slot 0..5 = Y_L,U_L,V_L,Y_R,U_R,"
+             "V_R; 6/7 = packed provenance L/R; 8 = packed Geometry RG16; "
+             "9 = raw surface RGBA16; 10 = transport RGBA16).")
         .def("synth3d_read_plate",
              [](sylc::NativeRenderer& r) -> py::object {
                  std::vector<uint8_t> buf;
@@ -2276,11 +2289,12 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                   }
                   confidence.assign(c.data(), c.data() + n);
               }
-              std::vector<float> boundary, scratch;
+              std::vector<float> boundary, scratch, fine_structure;
               {
                   py::gil_scoped_release nogil;
                   synth3d_surface::compute_boundary(
-                      refined, guide, width, height, boundary, scratch);
+                      refined, guide, width, height, boundary, scratch,
+                      threads, &fine_structure);
                   synth3d_surface::refine_observation(
                       refined, guide, confidence, boundary,
                       width, height, scratch, threads);
@@ -2297,6 +2311,34 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
           py::arg("confidence") = py::none(), py::arg("threads") = 1,
           "Exercise the production edge-aware depth-observation refinement. "
           "Returns (refined_depth, three-pixel_surface_boundary).");
+
+    m.def("_synth3d_fine_structure_test",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> luma,
+             int threads) {
+              if (luma.ndim() != 2) {
+                  throw std::runtime_error("luma must be a 2D float32 array");
+              }
+              const int height = static_cast<int>(luma.shape(0));
+              const int width = static_cast<int>(luma.shape(1));
+              const size_t n = static_cast<size_t>(width) * height;
+              std::vector<float> guide(luma.data(), luma.data() + n);
+              std::vector<float> boundary, scratch, fine_structure;
+              {
+                  py::gil_scoped_release nogil;
+                  // The filament discriminator only reads luma. Reusing it as
+                  // dummy depth keeps this private test surface on the exact
+                  // production compute_boundary() implementation.
+                  synth3d_surface::compute_boundary(
+                      guide, guide, width, height, boundary, scratch,
+                      threads, &fine_structure);
+              }
+              py::array_t<float> out({height, width});
+              std::memcpy(out.mutable_data(), fine_structure.data(),
+                          n * sizeof(float));
+              return out;
+          },
+          py::arg("luma"), py::arg("threads") = 1,
+          "Return the production two-sided luma-ridge filament score.");
 
     m.def("_synth3d_build_geometry_test",
           [](py::array_t<uint16_t,
@@ -2363,6 +2405,109 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
           py::arg("confidence") = py::none(), py::arg("threads") = 1,
           "Build the production foreground-ownership and stereo-safety maps.");
 
+    py::class_<DepthMultiscaleFilter>(m, "DepthMultiscaleFilter")
+        .def(py::init<int, int>(), py::arg("width"), py::arg("height"))
+        .def("reset", &DepthMultiscaleFilter::reset)
+        .def("apply",
+             [](DepthMultiscaleFilter& self,
+                py::array_t<uint16_t,
+                    py::array::c_style | py::array::forcecast> depth,
+                py::object flow_x_obj, py::object flow_y_obj,
+                py::object reliability_obj, py::object confidence_obj,
+                py::object boundary_obj, float source_dt_ms) {
+                 const int height = self.height();
+                 const int width = self.width();
+                 const size_t n = static_cast<size_t>(width) * height;
+                 if (depth.ndim() != 2 || depth.shape(0) != height ||
+                     depth.shape(1) != width)
+                     throw std::runtime_error("depth must match the filter grid");
+                 using FloatArray = py::array_t<
+                     float, py::array::c_style | py::array::forcecast>;
+                 FloatArray flow_x, flow_y, reliability, confidence, boundary;
+                 auto load_optional = [&](py::object value, FloatArray& out,
+                                          const char* name) -> const float* {
+                     if (value.is_none()) return nullptr;
+                     out = value.cast<FloatArray>();
+                     if (out.ndim() != 2 || out.shape(0) != height ||
+                         out.shape(1) != width)
+                         throw std::runtime_error(
+                             std::string(name) + " must match the filter grid");
+                     return out.data();
+                 };
+                 const float* fx = load_optional(flow_x_obj, flow_x, "flow_x");
+                 const float* fy = load_optional(flow_y_obj, flow_y, "flow_y");
+                 const float* rel = load_optional(
+                     reliability_obj, reliability, "reliability");
+                 const float* conf = load_optional(
+                     confidence_obj, confidence, "confidence");
+                 const float* edge = load_optional(
+                     boundary_obj, boundary, "boundary");
+                 std::vector<uint16_t> filtered(
+                     depth.data(), depth.data() + n);
+                 {
+                     py::gil_scoped_release nogil;
+                     self.apply(filtered.data(), fx, fy, rel, conf, edge,
+                                source_dt_ms);
+                 }
+                 py::array_t<uint16_t> out({height, width});
+                 std::copy(filtered.begin(), filtered.end(), out.mutable_data());
+                 return out;
+             },
+             py::arg("depth_q16"), py::arg("flow_x") = py::none(),
+             py::arg("flow_y") = py::none(),
+             py::arg("reliability") = py::none(),
+             py::arg("confidence") = py::none(),
+             py::arg("boundary") = py::none(),
+             py::arg("source_dt_ms") = DepthMultiscaleFilter::kReferenceDtMs)
+        .def_readwrite("worker_threads", &DepthMultiscaleFilter::worker_threads);
+
+    py::class_<SafetyTemporalFilter>(m, "SafetyTemporalFilter")
+        .def(py::init<int, int>(), py::arg("width"), py::arg("height"))
+        .def("reset", &SafetyTemporalFilter::reset)
+        .def("apply",
+             [](SafetyTemporalFilter& self,
+                py::array_t<uint16_t,
+                    py::array::c_style | py::array::forcecast> safety,
+                py::object flow_x_obj, py::object flow_y_obj,
+                float source_dt_ms) {
+                 const int height = self.height();
+                 const int width = self.width();
+                 const size_t n = static_cast<size_t>(width) * height;
+                 if (safety.ndim() != 2 || safety.shape(0) != height ||
+                     safety.shape(1) != width)
+                     throw std::runtime_error("safety must match the filter grid");
+                 using FloatArray = py::array_t<
+                     float, py::array::c_style | py::array::forcecast>;
+                 FloatArray flow_x, flow_y;
+                 auto load_flow = [&](py::object value, FloatArray& out,
+                                      const char* name) -> const float* {
+                     if (value.is_none()) return nullptr;
+                     out = value.cast<FloatArray>();
+                     if (out.ndim() != 2 || out.shape(0) != height ||
+                         out.shape(1) != width)
+                         throw std::runtime_error(
+                             std::string(name) + " must match the filter grid");
+                     return out.data();
+                 };
+                 const float* fx = load_flow(flow_x_obj, flow_x, "flow_x");
+                 const float* fy = load_flow(flow_y_obj, flow_y, "flow_y");
+                 std::vector<uint16_t> filtered(
+                     safety.data(), safety.data() + n);
+                 {
+                     py::gil_scoped_release nogil;
+                     self.apply(filtered.data(), 1, fx, fy, source_dt_ms);
+                 }
+                 py::array_t<uint16_t> out({height, width});
+                 std::copy(filtered.begin(), filtered.end(), out.mutable_data());
+                 return out;
+             },
+             py::arg("safety_q16"), py::arg("flow_x") = py::none(),
+             py::arg("flow_y") = py::none(),
+             py::arg("source_dt_ms") = SafetyTemporalFilter::kReferenceDtMs)
+        .def_readwrite("rise_per_reference",
+                       &SafetyTemporalFilter::rise_per_reference)
+        .def_readwrite("worker_threads", &SafetyTemporalFilter::worker_threads);
+
     py::class_<DepthStabilizer>(m, "DepthStabilizer")
         .def(py::init<size_t>(), py::arg("n"))
         .def("reset", &DepthStabilizer::reset,
@@ -2404,7 +2549,8 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              [](DepthStabilizer& self,
                 py::array_t<float, py::array::c_style | py::array::forcecast> raw,
                 py::object motion_obj, float scene_change,
-                py::object confidence_obj, py::object boundary_obj) {
+                py::object confidence_obj, py::object boundary_obj,
+                py::object fine_structure_obj) {
                  if (raw.ndim() != 1 || static_cast<size_t>(raw.shape(0)) != self.size())
                      throw std::runtime_error(
                          "raw must be a 1D float32 array of length " +
@@ -2445,13 +2591,27 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                              "array of length " + std::to_string(self.size()));
                      boundary_ptr = boundary.data();
                  }
+                 py::array_t<float, py::array::c_style | py::array::forcecast>
+                     fine_structure;
+                 const float* fine_structure_ptr = nullptr;
+                 if (!fine_structure_obj.is_none()) {
+                     fine_structure = fine_structure_obj.cast<py::array_t<
+                         float, py::array::c_style | py::array::forcecast>>();
+                     if (fine_structure.ndim() != 1 ||
+                         static_cast<size_t>(fine_structure.shape(0)) != self.size())
+                         throw std::runtime_error(
+                             "fine_structure must be None or a 1D float32 "
+                             "array matching raw");
+                     fine_structure_ptr = fine_structure.data();
+                 }
                  py::array_t<uint16_t> out(static_cast<py::ssize_t>(self.size()));
                  bool was_cut = false;
                  {
                      py::gil_scoped_release nogil;
                      was_cut = self.step(raw.data(), out.mutable_data(),
-                                         motion_ptr, scene_change,
-                                         confidence_ptr, boundary_ptr);
+                                          motion_ptr, scene_change,
+                                          confidence_ptr, boundary_ptr,
+                                          fine_structure_ptr);
                  }
                  return py::make_tuple(out, was_cut);
              },
@@ -2459,6 +2619,7 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              py::arg("scene_change") = 0.0f,
              py::arg("confidence") = py::none(),
              py::arg("surface_boundary") = py::none(),
+             py::arg("fine_structure") = py::none(),
              "raw model output (float32 1D, length n) -> (out_q16 uint16 1D, was_cut bool).")
         .def_readwrite("alpha", &DepthStabilizer::alpha)
         .def_readwrite("alpha_static", &DepthStabilizer::alpha_static)
@@ -2466,6 +2627,12 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def_readwrite("motion_low", &DepthStabilizer::motion_low)
         .def_readwrite("motion_high", &DepthStabilizer::motion_high)
         .def_readwrite("tone_alpha", &DepthStabilizer::tone_alpha)
+        .def_readwrite("tone_expand_rate", &DepthStabilizer::tone_expand_rate)
+        .def_readwrite("tone_max_step_frac",
+                       &DepthStabilizer::tone_max_step_frac)
+        .def_readwrite("tone_prime_margin",
+                       &DepthStabilizer::tone_prime_margin)
+        .def_readwrite("tone_lock", &DepthStabilizer::tone_lock)
         .def_readwrite("depth_contrast", &DepthStabilizer::depth_contrast)
         .def_readwrite("depth_scurve", &DepthStabilizer::depth_scurve)
         .def_readwrite("confidence_floor", &DepthStabilizer::confidence_floor)
@@ -2485,6 +2652,8 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                        &DepthStabilizer::temporal_stable_high)
         .def_readwrite("boundary_fast_motion",
                        &DepthStabilizer::boundary_fast_motion)
+        .def_readwrite("fine_structure_motion_discount",
+                       &DepthStabilizer::fine_structure_motion_discount)
         .def_readwrite("cut_threshold", &DepthStabilizer::cut_threshold)
         .def_readwrite("scene_cut_threshold", &DepthStabilizer::scene_cut_threshold)
         .def_readwrite("snap_frac", &DepthStabilizer::snap_frac)

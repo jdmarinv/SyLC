@@ -281,7 +281,7 @@ def _get_nuitka_data_dir():
         if hasattr(__main__, '__file__') and __main__.__file__:
             main_dir = os.path.dirname(os.path.abspath(__main__.__file__))
             candidates.append(('__main__.__file__', main_dir))
-    except:
+    except Exception:
         pass
 
     # Method 4: sys.path[0] (often set by Nuitka)
@@ -307,7 +307,7 @@ def _get_nuitka_data_dir():
                            os.path.exists(os.path.join(onefile_dir, 'mvc_demuxer_cpp.cp314-win_amd64.pyd')):
                             candidates.append(('TEMP/onefile_*', onefile_dir))
                             break
-    except:
+    except Exception:
         pass
 
     # Debug: print all candidates
@@ -1957,7 +1957,7 @@ class MVCDecoderThread(QThread):
                 try:
                     self.demuxer.close()
                     logger.info("[MVC-THREAD] Demuxer closed in thread")
-                except:
+                except Exception:
                     pass  # Ignore close errors
                 self.demuxer = None
 
@@ -4192,7 +4192,7 @@ class MVCDecoderThread(QThread):
                                     if self.decoder and frame_struct.return_arg:
                                         try:
                                             edge264.edge264_return_frame(self.decoder, frame_struct.return_arg)
-                                        except:
+                                        except Exception:
                                             pass
                                     break
                                 # V8 SYNC GATE FIX: Use stabilization drain when in sync gate or seek mode
@@ -4206,7 +4206,7 @@ class MVCDecoderThread(QThread):
                                     if self.decoder and frame_struct.return_arg:
                                         try:
                                             edge264.edge264_return_frame(self.decoder, frame_struct.return_arg)
-                                        except:
+                                        except Exception:
                                             pass
                                 self.frame_count += 1
                                 drained_count += 1

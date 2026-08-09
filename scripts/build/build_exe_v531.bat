@@ -1,5 +1,5 @@
 @echo off
-REM === SyLC 3D Player v5.3.0 - standalone no-console build (Nuitka, one-folder) ===
+REM === SyLC 3D Player v5.3.1 - standalone no-console build (Nuitka, one-folder) ===
 REM Prereqs: Python 3.14 venv with requirements.txt + nuitka (run from the activated venv)
 REM          + MSVC 2022 build tools. The script may be run from any directory.
 REM The portable build ships no depth model weights. The twenty ONNX graphs
@@ -64,7 +64,7 @@ uv run python -m nuitka SyLC_3D_Player.py ^
   --include-data-files=assets/splash.png=assets/splash.png ^
   --output-dir=build_release_v530 ^
   --output-filename=SyLC_3D_Player.exe ^
-  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=5.3.0 --product-version=5.3.0
+  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=5.3.1 --product-version=5.3.1
 
 if errorlevel 1 (
   echo.

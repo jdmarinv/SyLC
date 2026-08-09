@@ -5,8 +5,12 @@ Le futur décodé existe déjà (presentation_queue ~12 frames) ; ce scout le
 REGARDE en miniature et publie des événements datés que le stabilisateur de
 profondeur consommera comme préavis. Deux filtres, chacun à SA résolution :
 
-  - CUTS à 64 px : distance TV d'histogrammes, seuil production 0,42 —
-    précision/rappel 1,0 mesurés (oracle_results_pyramid.json) ;
+  - CUTS à 64 px : distance TV d'histogrammes, armement à 0,28 confirmé par
+    la FORME (pic isolé puis frame calme). Le rappel 1,0 annoncé par
+    oracle_results_pyramid.json pour le seuil nu à 0,42 ne tenait pas sur les
+    coupes peu contrastées : mesuré sur l'encodage x264, 7 coupes franches
+    sur 16 étaient manquées, dont celle à 96,97 s (TV 0,296 pour un seuil à
+    0,42, alors qu'elle vaut 9,6x l'ambiant). Voir CUT_TV ;
   - TEMPÊTES de mouvement à 192 px : flot moyen normalisé en pixels de grille
     518, seuil absolu — 192 px est LA BARRIÈRE mesurée (rappel 0,88 pour 14 %
     du coût ; en dessous le signal s'effondre : 0,51 à 96 px). L'oracle a
@@ -35,7 +39,36 @@ except Exception:      # pragma: no cover - flow binding absent => cuts only
 GRID_REF = 518
 CUT_SIDE = 64
 STORM_SIDE = 192       # la barrière : ne JAMAIS descendre en dessous
-CUT_TV = 0.42          # seuil production (scene_cut_threshold)
+# Seuil d'ARMEMENT du filtre cut. Historiquement 0,42, valeur choisie quand
+# la publication se faisait sur franchissement nu : il fallait un seuil assez
+# haut pour qu'aucun flash ne l'atteigne, et les coupes peu contrastées
+# passaient à travers. _analyze exige désormais un pic ISOLÉ suivi d'une frame
+# calme, ce qui rejette le flash par sa FORME et non par son amplitude, donc
+# la barre peut descendre là où le signal vit réellement.
+# Balayage sur l'encodage x264 (scout_probe, 2 x 2500 frames, ambiant ~0,031) :
+#   0,42 -> 9 et 19 coupes,  la plus faible admise a 13,7x et 16,1x l'ambiant
+#   0,28 -> 16 et 22 coupes, la plus faible admise a 9,6x et 9,4x
+#   0,18 -> 16 et 28 coupes, la plus faible tombe a 5,6x : le mouvement entre
+# La bande 0,26-0,30 gagne 44 % de rappel sans jamais descendre sous 9x
+# l'ambiant, quand le mouvement et le grain vivent à 1-2x.
+# Back to 0.42 on 2026-08-08 after a live A/B: at 0.28 the judder on slow
+# passages got worse.  The sweep that justified 0.28 measured the ratio to
+# ambient -- a proxy for "is this a cut" -- and the proxy was not enough on
+# its own.  0.28 remains the value that recovers low-contrast cuts (the 96.97 s
+# transition reads 0.296) and should be revisited once the boundary
+# OVER-RECORDING is fixed: the pipeline registers 47 boundaries/min where this
+# scout publishes 8.6, so every extra publication is currently multiplied.
+CUT_TV = 0.42
+# Kill-switch, house idiom: SYLC_SYNTH3D_CUT_TV=0.42 restores the pre-2026-08-08
+# bar exactly, so "is the new sensitivity causing this?" is a restart rather
+# than a code edit. A false cut hard-resets the depth temporal state and reads
+# as geometry judder, which is the symptom this must be answerable against.
+try:
+    import os as _os
+    CUT_TV = max(0.05, min(0.95, float(_os.environ.get(
+        "SYLC_SYNTH3D_CUT_TV", CUT_TV))))
+except ValueError:
+    pass
 STORM_THR_PX = 4.5     # px grille 518 (P85 Oblivion : 4.452)
 CALM_FRAMES = 3        # une tempête « éclate » après >= 3 frames calmes
 CALM_FACTOR = 0.6
@@ -84,6 +117,10 @@ class LookAheadScout:
         # cut at T0 is published before that decoded T0 frame is presented.
         self.reorder_depth = max(0, int(reorder_depth))
         self._pending = []          # frames poussées, triées pts, pas analysées
+        # Confirmation « pic puis calme » du filtre cut (voir _analyze).
+        self._cut_armed = False
+        self._cut_previous_exceeded = False
+        self._cut_pending_pts = None
         self._prev = None           # dernière frame ANALYSÉE (pts, mini64, mini192)
         self._calm_run = CALM_FRAMES  # frames calmes consécutives (démarre calme)
         # Les événements sont ÉCRITS par le fil décodeur (push/_analyze) et
@@ -161,11 +198,33 @@ class LookAheadScout:
         if prev is None or pts <= prev[0]:
             return
         # Filtre 1 : cut (64 px, histogrammes)
-        is_cut = _tv_distance(prev[1], mini64) >= self.cut_tv
-        if is_cut:
+        tv = _tv_distance(prev[1], mini64)
+        is_cut = tv >= self.cut_tv
+        # Publication différée d'UNE frame : une coupe est un pic suivi de
+        # CALME, un flash est un pic suivi d'un pic EN SENS INVERSE. Le seuil
+        # nu ne distingue pas les deux et devait donc rester assez haut pour
+        # qu'aucun flash ne l'atteigne — au prix des coupes peu contrastées.
+        # Mesuré sur l'encodage x264 : la coupe à 96,97 s vaut TV 0,296 pour
+        # un seuil à 0,42, soit 9,6x l'ambiant (0,031) et 70:1 contre la frame
+        # suivante — une coupe franche indiscutable, invisible au seuil nu. À
+        # 0,42, 7 coupes sur 16 étaient manquées sur cette fenêtre.
+        # Le report ne coûte rien ici : ce filtre regarde le futur décodé
+        # (~12 frames de tampon), il lui en reste onze d'avance.
+        calm = tv < 0.5 * self.cut_tv
+        if self._cut_armed and calm and self._cut_pending_pts is not None:
             with self._events_lock:
-                self._cut_events.append(pts)
+                self._cut_events.append(self._cut_pending_pts)
                 self.cuts_published += 1
+            self._cut_pending_pts = None
+        # Seul un dépassement ISOLÉ arme : le second dépassement d'un flash
+        # (le retour) ne doit pas pouvoir se faire confirmer par le calme qui
+        # le suit. Un plan de deux frames est refusé par la même règle — un
+        # reset tardif coûte moins cher qu'un faux, cf. la passe du 06/08 sur
+        # le pompage de profondeur.
+        self._cut_armed = is_cut and not self._cut_previous_exceeded
+        if is_cut:
+            self._cut_pending_pts = pts
+        self._cut_previous_exceeded = is_cut
         # Filtre 2 : tempête (192 px, flot moyen normalisé)
         if _HAVE_FLOW and mini192 is not None and prev[2] is not None:
             fx, fy, q = _m._synth3d_estimate_flow_test(

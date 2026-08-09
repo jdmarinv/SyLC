@@ -216,7 +216,7 @@ class SubtitleExtractor:
                         self._mkvextract_available = True
                         logger.info(f"[SubtitleExtractor] mkvextract found at {candidate}")
                         return True
-                except:
+                except Exception:
                     continue
             self._mkvextract_available = False
             logger.warning("[SubtitleExtractor] mkvextract not found - subtitle extraction will be slower")

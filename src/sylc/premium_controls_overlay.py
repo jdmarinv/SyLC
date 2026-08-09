@@ -110,7 +110,7 @@ def _extract_thumbnail_ffmpeg(video_file, time_pos):
         if result.returncode == 0 and os.path.exists(temp_file):
             return temp_file
         return None
-    except:
+    except Exception:
         return None
 
 
@@ -1167,7 +1167,7 @@ class PremiumTimelineSlider(QSlider):
             temp_file = future.result()
             if temp_file:
                 self.extraction_done.emit(time_pos, temp_file)
-        except:
+        except Exception:
             pass
 
     @Slot(float, str)
@@ -1180,7 +1180,7 @@ class PremiumTimelineSlider(QSlider):
                     self._preview_widget.set_thumbnail(pixmap)
             try:
                 os.remove(temp_file)
-            except:
+            except Exception:
                 pass
         except Exception:
             pass
@@ -1568,9 +1568,10 @@ class PremiumControlsOverlay(QWidget):
     synth3d_toggled = Signal(bool)  # enable/disable real-time 2D->3D AI conversion
     synth3d_depth_view_toggled = Signal(bool)  # show the raw depth map instead of the warped stereo pair
     synth3d_diagnostics_toggled = Signal(bool)  # live depth/disocclusion overlay
-    synth3d_preset_selected = Signal(str)  # comfort|cinema|immersion|custom
+    synth3d_preset_selected = Signal(str)  # comfort|cinema
     synth3d_depth_preset_selected = Signal(str)  # Quality|Balanced|Performance
     synth3d_download_models_requested = Signal()
+    synth3d_calibration_requested = Signal()
     # Sliders are single-purpose (Task 8 review): *_preview fires on every
     # valueChanged (live push to the renderer, never persisted to disk);
     # *_changed fires only on sliderReleased (the value the host persists).
@@ -2476,11 +2477,12 @@ class PremiumControlsOverlay(QWidget):
         preset_group = QActionGroup(preset_menu)
         preset_group.setExclusive(True)
         preset_actions = {}
+        # Only the two authored choices are pickable. Moving either fine-tune
+        # slider still creates an internal Custom state, reflected in the row
+        # title, but it is not presented as a third preset.
         for key, label in (
                 ("comfort", "Comfort"),
-                ("cinema", "Cinema"),
-                ("immersion", "Immersion"),
-                ("custom", "Custom")):
+                ("cinema", "Cinema")):
             action = QAction(label, preset_menu)
             action.setCheckable(True)
             action.setData(key)
@@ -2490,7 +2492,6 @@ class PremiumControlsOverlay(QWidget):
                 lambda checked=False, name=key:
                     self.synth3d_preset_selected.emit(name) if checked else None)
             preset_actions[key] = action
-        preset_actions["custom"].setChecked(True)
         menu.addMenu(preset_menu)
 
         # The sliders are the fine end of the same register as the presets
@@ -2529,8 +2530,15 @@ class PremiumControlsOverlay(QWidget):
         diagnostics_action.setCheckable(True)
         diagnostics_action.setIcon(
             self._export_menu_icon('pulse', PremiumColors.WARNING))
+        calibration_action = QAction("Projection room calibration…", menu)
+        calibration_action.setIcon(
+            self._export_menu_icon('parallax', PremiumColors.WARNING))
+        calibration_action.setToolTip(
+            "Measure the screen and viewing position used by Stereo Lab's "
+            "physical comfort envelope")
         menu.addAction(depth_view_action)
         menu.addAction(diagnostics_action)
+        menu.addAction(calibration_action)
 
         # Do not put the diagnostics in QAction.text(): QMenu measures actions
         # as a single unbreakable row and therefore grew to the full length of
@@ -2574,6 +2582,7 @@ class PremiumControlsOverlay(QWidget):
         self.synth3d_depth_preset_group = depth_preset_group
         self.synth3d_depth_preset_actions = depth_preset_actions
         self.synth3d_download_models_action = download_models_action
+        self.synth3d_calibration_action = calibration_action
         self.synth3d_status_action = status_action
         self.synth3d_status_label = status_label
         self.synth3d_depth_preset_header = depth_preset_header
@@ -2586,6 +2595,8 @@ class PremiumControlsOverlay(QWidget):
             self.synth3d_auto_convergence_toggled)
         temporal_fill_action.toggled.connect(
             self.synth3d_temporal_fill_toggled)
+        calibration_action.triggered.connect(
+            lambda _checked=False: self.synth3d_calibration_requested.emit())
 
         self.synth3d_menu_header = header
         self.synth3d_menu = menu
@@ -2645,7 +2656,7 @@ class PremiumControlsOverlay(QWidget):
             if menu is None or key is None:
                 continue
             action = (actions or {}).get(str(key))
-            label = action.text() if action is not None else str(key)
+            label = action.text() if action is not None else str(key).title()
             menu.setTitle("%s — %s" % (stem, label) if label else stem)
 
     def _add_menu_slider(self, menu, label, lo, hi, val, preview_signal, changed_signal):

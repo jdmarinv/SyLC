@@ -81,6 +81,23 @@ class HevcDecodeThread(QThread):
         self._av_sync_offset_ms = 0.0
         self._sync_drop_count = 0
         self._backpressure_drop_count = 0
+        # --- pump census -------------------------------------------------
+        # A freeze here is silent by construction: the look-ahead tap sits
+        # BEFORE every drop, so the scout keeps reporting full cadence while
+        # not one frame reaches a window.  These count each stage a decoded
+        # frame can die at, and _pending_since dates the outstanding delivery
+        # token -- the one-slot credit returned by presentation_consumed().
+        # A token outstanding for seconds is not back-pressure, it is a lost
+        # acknowledgement, and every later frame is dropped for good.
+        self._pump_decoded = 0
+        self._pump_cancelled = 0        # seek/stop/pause landed during pacing
+        self._pump_emitted = 0
+        self._pump_acked = 0
+        self._pending_since = None      # perf_counter when the token was taken
+        self._pending_max_s = 0.0
+        self._token_expired = 0
+        self._pump_log_at = 0.0
+        self._pump_stuck_seen = False
         self._lookahead_scout = None
         self._lookahead_enabled = False
         # Public media cadence contract consumed by asynchronous 2D->3D
@@ -102,6 +119,14 @@ class HevcDecodeThread(QThread):
             2000.0, float(av_sync_offset_s) * 1000.0))
         self._sync_drop_count = 0
         self._backpressure_drop_count = 0
+        self._pump_decoded = 0
+        self._pump_cancelled = 0
+        self._pump_emitted = 0
+        self._pump_acked = 0
+        self._pending_since = None
+        self._pending_max_s = 0.0
+        self._token_expired = 0
+        self._pump_stuck_seen = False
 
     def set_mode(self, mode):
         """Live stereo-mode switch from the UI combo ('sbs' | 'tab' | None). A plain
@@ -150,6 +175,12 @@ class HevcDecodeThread(QThread):
         frame while the GUI still owns the first one.  It continues decoding on
         the media timeline and simply discards obsolete presentations.
         """
+        held = self._pending_since
+        if held is not None:
+            self._pending_max_s = max(self._pending_max_s,
+                                      time.perf_counter() - held)
+        self._pending_since = None
+        self._pump_acked += 1
         self._presentation_pending = False
 
     def set_lookahead_enabled(self, enabled):
@@ -193,11 +224,105 @@ class HevcDecodeThread(QThread):
             self._lookahead_enabled = False
 
     def sync_stats(self):
+        held = self._pending_since
         return {
             'sync_drops': int(self._sync_drop_count),
             'backpressure_drops': int(self._backpressure_drop_count),
             'presentation_pending': bool(self._presentation_pending),
+            'decoded': int(self._pump_decoded),
+            'cancelled': int(self._pump_cancelled),
+            'emitted': int(self._pump_emitted),
+            'acked': int(self._pump_acked),
+            # Age of the OUTSTANDING delivery token. Back-pressure holds it for
+            # at most a frame; anything in seconds means the acknowledgement
+            # never came back and every later frame is being dropped for good.
+            'pending_ms': (0.0 if held is None
+                           else (time.perf_counter() - held) * 1000.0),
+            'pending_max_ms': self._pending_max_s * 1000.0,
+            'token_expired': int(self._token_expired),
         }
+
+    # Bounded delivery is a single credit with no way back when an
+    # acknowledgement is lost.  Measured 2026-08-09 on No Time To Die: one
+    # emission out of 361 never came back, and every one of the 576 frames
+    # decoded over the following 26 s was dropped in back-pressure while decode,
+    # audio and the look-ahead tap all ran at full cadence.  The healthy hold
+    # peaked at 276 ms in that same run, so a token older than a second is not
+    # back-pressure -- it is an acknowledgement that will never arrive.
+    TOKEN_EXPIRY_S = 1.0
+    # The census alarm now guards the guard: a token still held at twice the
+    # expiry means the expiry never ran, which is the only remaining way for
+    # the picture to stop with a silent log.
+    STUCK_ALARM_S = 2.0 * TOKEN_EXPIRY_S
+
+    def _expire_stale_token(self):
+        """Reclaim a delivery token whose acknowledgement was lost.
+
+        Returns True when a token was reclaimed, i.e. this frame may be sent.
+
+        This is not a workaround dressed as a fix: the loss it recovers from is
+        counted and logged every single time, so the underlying defect stays as
+        visible as it was without it -- while the picture keeps moving.
+
+        Known and accepted: a very late acknowledgement can arrive after an
+        expiry and free the FRESHER token, putting at most one extra frame in
+        flight.  That is the behaviour bounded delivery replaced, for one frame,
+        against a permanent freeze.
+        """
+        held = self._pending_since
+        if held is None or (time.perf_counter() - held) < self.TOKEN_EXPIRY_S:
+            return False
+        self._token_expired += 1
+        logger.warning(
+            "[PUMP] jeton de presentation expire apres %.1f s sans "
+            "acquittement (%d fois) : livraison relancee. "
+            "presentation_consumed() n'est pas revenu pour cette image.",
+            time.perf_counter() - held, self._token_expired)
+        self._presentation_pending = False
+        self._pending_since = None
+        return True
+
+    def _pump_census(self):
+        """One compact line naming where decoded frames are dying.
+
+        Quiet in health (every 30 s), immediate once a delivery token has
+        outlived its expiry -- which, since the expiry exists, means the expiry
+        itself did not run.  That is the one state left where the picture stops
+        and nothing in the log says so.
+        """
+        now = time.perf_counter()
+        held = self._pending_since
+        stuck_s = 0.0 if held is None else now - held
+        stuck = stuck_s >= self.STUCK_ALARM_S
+        if not stuck:
+            self._pump_stuck_seen = False
+        # The ONSET of a block is reported at once. Deferring it to the window
+        # would hide it for up to five seconds whenever the previous line
+        # happened to be printed while everything was still healthy -- which is
+        # precisely the case every time a freeze begins.
+        first = stuck and not self._pump_stuck_seen
+        if not first and now - self._pump_log_at < (5.0 if stuck else 30.0):
+            return
+        self._pump_stuck_seen = stuck
+        self._pump_log_at = now
+        # Strictly key=value, like the [2D3D] line: freeze_triage.py reads both
+        # and a freeze is only ever diagnosed by comparing them.
+        logger.info(
+            "[PUMP] decoded=%d emitted=%d acked=%d sync_drop=%d cancel=%d "
+            "backpressure=%d token=%s held_ms=%.0f held_max_ms=%.0f "
+            "expired=%d",
+            self._pump_decoded, self._pump_emitted, self._pump_acked,
+            self._sync_drop_count, self._pump_cancelled,
+            self._backpressure_drop_count,
+            "held" if self._presentation_pending else "free",
+            stuck_s * 1000.0, self._pending_max_s * 1000.0,
+            self._token_expired)
+        if stuck:
+            logger.warning(
+                "[PUMP] jeton de presentation retenu %.1f s alors que "
+                "l'expiration est fixee a %.1f s : elle n'a pas joue. "
+                "Toutes les images decodees partent en backpressure.",
+                stuck_s, self.TOKEN_EXPIRY_S)
 
     def _master_clock_ms(self):
         provider = self.clock_offset_provider
@@ -341,6 +466,12 @@ class HevcDecodeThread(QThread):
                         self.endOfStream.emit()
                     return
                 left, right, pts_ms = out
+                self._pump_decoded += 1
+                # Once per decoded frame, whatever stage that frame dies at
+                # further down -- several of them `continue`, so a census
+                # placed at the end of the body would miss exactly the paths
+                # worth reporting.
+                self._pump_census()
                 # The tap belongs immediately after decode, BEFORE pacing and
                 # before any late/backpressure drop. Even a frame not presented
                 # can carry the boundary crossed by the next visible frame.
@@ -420,6 +551,7 @@ class HevcDecodeThread(QThread):
                 # Recheck peremption AVANT emission, quel que soit le pts:
                 # une frame decodee avant un seek ne part jamais.
                 if self._seek_req is not None or self._stop or self._paused:
+                    self._pump_cancelled += 1
                     continue
                 if _diag:
                     _te = time.perf_counter()
@@ -445,11 +577,16 @@ class HevcDecodeThread(QThread):
                         _m_master_changes = 0
                         _m_master_lo = None
                         _m_master_hi = None
-                if self._bounded_delivery and self._presentation_pending:
+                blocked = self._bounded_delivery and self._presentation_pending
+                if blocked and self._expire_stale_token():
+                    blocked = False
+                if blocked:
                     self._backpressure_drop_count += 1
                 else:
                     if self._bounded_delivery:
                         self._presentation_pending = True
+                        self._pending_since = time.perf_counter()
+                    self._pump_emitted += 1
                     self.frameYUVReady.emit(left, right)
                     self.frameYUVTimedReady.emit(left, right, float(pts_ms))
                 # Timeline feed: throttled (250 ms of pts progress, or any

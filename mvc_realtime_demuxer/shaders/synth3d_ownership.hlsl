@@ -8,8 +8,8 @@
 cbuffer OwnerCB : register(b0) {
     uint OwnerWidth;
     uint OwnerHeight;
-    uint OwnerPad0;
-    uint OwnerPad1;
+    float OwnerSafetyRise;
+    uint OwnerSafetyReset;
 };
 
 Texture2D<float4> OwnerSurface : register(t0);
@@ -192,4 +192,45 @@ void CS_OwnerCompose(uint3 tid : SV_DispatchThreadID) {
     OwnerGeometryOut[p] = saturate(float2(
         rawDepth + state.b * (state.r - rawDepth),
         state.g + 0.72 * state.b));
+}
+
+float owner_sample_safety(float2 position) {
+    position = clamp(position, float2(0.0, 0.0),
+                     float2(OwnerWidth - 1, OwnerHeight - 1));
+    int2 p0 = int2(position);
+    int2 p1 = min(p0 + int2(1, 1),
+                  int2(OwnerWidth - 1, OwnerHeight - 1));
+    float2 f = position - float2(p0);
+    float a = lerp(OwnerScalar.Load(int3(p0, 0)),
+                   OwnerScalar.Load(int3(int2(p1.x, p0.y), 0)), f.x);
+    float b = lerp(OwnerScalar.Load(int3(int2(p0.x, p1.y), 0)),
+                   OwnerScalar.Load(int3(p1, 0)), f.x);
+    return lerp(a, b, f.y);
+}
+
+// Conservative temporal release for the composed stereo budget. OwnerRgb is
+// rebound to the published transport plane and OwnerScalar to the previous
+// R32F safety history for this pass. Unsafe changes attack immediately;
+// recovery is flow-transported and bounded. min(current, ...) is the safety
+// proof: history can only flatten more than the current ownership analysis,
+// never restore disparity it rejected.
+[numthreads(16, 16, 1)]
+void CS_OwnerSafetyTemporal(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= OwnerWidth || tid.y >= OwnerHeight) return;
+    int2 p = int2(tid.xy);
+    float rawDepth = OwnerSurface.Load(int3(p, 0)).r;
+    float4 state = OwnerState.Load(int3(p, 0));
+    float2 geometry = saturate(float2(
+        rawDepth + state.b * (state.r - rawDepth),
+        state.g + 0.72 * state.b));
+    float filtered = geometry.y;
+    if (OwnerSafetyReset == 0) {
+        float2 packedFlow = OwnerRgb.Load(int3(p, 0)).xy;
+        float2 flow = (packedFlow - 0.5) * 128.0;
+        float carried = owner_sample_safety(float2(p) - flow);
+        filtered = min(geometry.y, carried + max(0.0, OwnerSafetyRise));
+    }
+    filtered = saturate(filtered);
+    OwnerScalarOut[p] = filtered;
+    OwnerGeometryOut[p] = float2(geometry.x, filtered);
 }

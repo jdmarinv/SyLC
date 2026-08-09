@@ -55,13 +55,14 @@ cbuffer SynthCB : register(b0) {
     int temporal_fill;   // c4.x  round 5a background plate on/off
     float plate_ceiling; // c4.y  nearness ceiling for plate refresh
     float far_snap_on;   // c4.z  v4 sub-texel background reclaim (1=on)
-    float _pad4;         // c4.w
-    // c5 is consumed by the downstream Stereo Lab through C++ parameters;
-    // keeping its native layout explicit makes c6 unambiguous here.
+    float guided_snap_on;// c4.w  primary full-resolution layer snap
+    // c5 owns the one physical projection of the artistic disparity. Stereo
+    // Lab receives the same values only to audit that projection; it never
+    // applies another geometric warp.
     float comfort_soft_disp; // c5.x
     float comfort_hard_disp; // c5.y
     int comfort_enabled;     // c5.z
-    float _pad5;             // c5.w
+    float robust_grid_on;    // c5.w  max-of-medians nearness repair
     int lookahead_fill;      // c6.x  future evidence valid for this exact PTS
     float lookahead_min_conf;// c6.y  conservative acceptance knee
     float lookahead_strength;// c6.z  maximum reveal blend
@@ -208,14 +209,16 @@ float guided_nearness(float2 uv) {
     if (!in_active_content(uv)) return convergence;
     float2 depth_uv = saturate(source_to_depth_uv(uv));
     float y0 = source_luma(uv);
-    float n0 = robust_grid_nearness(depth_uv);
+    float2 center = (floor(depth_uv / depth_texel) + 0.5) * depth_texel;
+    float n0 = robust_grid_on > 0.5
+        ? robust_grid_nearness(depth_uv)
+        : effective_nearness(Geometry.SampleLevel(linSmp, center, 0));
 
     // One coherent 3x3 exact-texel neighbourhood supplies BOTH candidates:
     // A is a joint depth/luma mean for smooth gradients; B is a real sampled
     // layer, never the bilinear semi-depth at a contour. Reusing the same taps
     // costs roughly the old cross+four-corner implementation while observing
     // diagonal and one-texel-thin structures that the four-corner set missed.
-    float2 center = (floor(depth_uv / depth_texel) + 0.5) * depth_texel;
     float matte_a0 = human_alpha(uv);
     float sum = 1.25 * n0;
     float weights = 1.25;
@@ -268,7 +271,7 @@ float guided_nearness(float2 uv) {
     // to win through guide agreement. A minority FAR sample is a likely model
     // crack; it needs spatial consensus and therefore remains in robust n0/A.
     float near_or_consensus = smoothstep(-0.035, 0.005, B - n0);
-    float snap = depth_edge * guide_edge * near_or_consensus;
+    float snap = guided_snap_on * depth_edge * guide_edge * near_or_consensus;
     float result = lerp(A, B, snap);
 
     // v4 (04/08) — sub-texel background reclaim. The CPU contour re-anchor
@@ -282,7 +285,6 @@ float guided_nearness(float2 uv) {
     // and the pixel's own full-resolution luma votes between them. Guards:
     // a real layer separation between the reps, reclaim pulls toward FAR
     // only, full-res ridges (hair/wire) and the human matte veto it.
-    // SYLC_SYNTH3D_FAR_SNAP=0 disables (cb flag).
     float gate = depth_edge * guide_edge;
     if (far_snap_on > 0.5 && gate > 0.05) {
         float2 lc = saturate(center - float2(2.0 * depth_texel.x, 0.0));
@@ -415,6 +417,24 @@ float comfortable_depth_offset(float nearness) {
     return (d < 0.0 ? -1.0 : 1.0) * softened * span;
 }
 
+// Calibrated VAC envelope. `disparity` is the full binocular separation as a
+// fraction of image width. The map is identity through the soft knee,
+// sign-preserving and monotonic, then approaches the hard physical limit
+// without a clipping shelf. This is the sole production application; every
+// inverse/forward solve below calls disp_for_nearness and therefore sees one
+// coherent geometry for both eyes.
+float project_comfort_disparity(float disparity) {
+    if (comfort_enabled == 0 || comfort_soft_disp < 0.0 ||
+        comfort_hard_disp <= comfort_soft_disp)
+        return disparity;
+    float magnitude = abs(disparity);
+    if (magnitude <= comfort_soft_disp) return disparity;
+    float span = comfort_hard_disp - comfort_soft_disp;
+    float over = magnitude - comfort_soft_disp;
+    float projected = comfort_soft_disp + over / (1.0 + over / span);
+    return disparity < 0.0 ? -projected : projected;
+}
+
 float disp_for_nearness(float2 uv, float nearness) {
     float safety = stereo_safety(uv);
     float boundary = 0.0;
@@ -435,8 +455,9 @@ float disp_for_nearness(float2 uv, float nearness) {
         matte_budget = lerp(
             1.0, matte_mode >= 2 ? 0.08 : 0.36, boundary);
     }
-    return max_disp * safe_budget * matte_budget *
-           comfortable_depth_offset(nearness);
+    float artistic = max_disp * safe_budget * matte_budget *
+                     comfortable_depth_offset(nearness);
+    return project_comfort_disparity(artistic);
 }
 
 float disp_at(float2 uv) {

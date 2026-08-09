@@ -225,6 +225,7 @@ private:
     CP<ID3D11Buffer>          cb_;                     // b0: SynthCB (112 bytes)
     CP<ID3D11ComputeShader>   csOwnerUncertainty_, csOwnerDilate_;
     CP<ID3D11ComputeShader>   csOwnerLocal_, csOwnerPropagate_, csOwnerCompose_;
+    CP<ID3D11ComputeShader>   csOwnerSafetyTemporal_;
     CP<ID3D11Buffer>          ownerCb_;                // b0: grid width/height
 
     CP<ID3D11Texture2D>       prepTex_;                // grid RGBA32F, RTV+SRV
@@ -250,6 +251,11 @@ private:
     CP<ID3D11Texture2D>          ownerStateTex_[2];
     CP<ID3D11ShaderResourceView> ownerStateSrv_[2];
     CP<ID3D11UnorderedAccessView> ownerStateUav_[2];
+    CP<ID3D11Texture2D>          safetyHistoryTex_[2]; // grid R32F, flow-carried
+    CP<ID3D11ShaderResourceView> safetyHistorySrv_[2];
+    CP<ID3D11UnorderedAccessView> safetyHistoryUav_[2];
+    int                           safety_history_read_ = 0;
+    bool                          safety_history_valid_ = false;
 
     // Round 5a — temporal background plate (all grid-sized):
     // transport = flow x/y + reliability from the published map; plate =

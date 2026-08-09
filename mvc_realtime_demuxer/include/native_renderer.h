@@ -179,7 +179,9 @@ public:
     // size, and neither over-reading it nor cropping it is acceptable. True when
     // no pipeline exists yet: that stays the historic silent no-op, and nothing
     // is read. read_plane stages one warp output back to the CPU (slot 0..5 =
-    // Y_L,U_L,V_L,Y_R,U_R,V_R); it MAPs blocking, never on the playback path.
+    // Y_L,U_L,V_L,Y_R,U_R,V_R; diagnostic 6/7 = packed provenance L/R,
+    // 8 = Geometry RG16, 9 = raw surface RGBA16, 10 = transport RGBA16);
+    // it MAPs blocking, never on the playback path.
     bool synth3d_set_test_depth(const uint16_t* q16_or_null, size_t count);
     bool synth3d_set_test_geometry(const uint16_t* depth,
                                    const uint16_t* owned,

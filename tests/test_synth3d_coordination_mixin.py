@@ -16,7 +16,7 @@ class _Harness(Synth3DCoordinationMixin):
         self._synth3d_preset = 'comfort'
         self._synth3d_strength = 0.8
         self._synth3d_convergence = 0.62
-        self._synth3d_pending_cut_pts = None
+        self._synth3d_pending_cuts = []
         self._synth3d_matte_cut_seen_ms = -math.inf
         self._synth3d_matte_floor_pts_ms = -math.inf
         self._synth3d_aspect_override = None
@@ -77,30 +77,63 @@ def test_media_fps_snaps_integer_millisecond_quantization():
     assert Synth3DCoordinationMixin._snap_media_fps(float('nan')) is None
 
 
-def test_cut_boundary_keeps_earliest_unseen_future_cut():
+def test_cut_boundary_queues_every_distinct_future_cut():
+    """The regression this replaced: a LATER cut arriving while an earlier one
+    waits for its presentation used to be dropped, silently.  The scout leads
+    by up to 12 decoded frames, so two cuts inside that window is ordinary on
+    short shots -- and it cost 23% of matte epoch advances, measured live
+    (30 boundaries consumed by the depth path against 23 matte resets)."""
     player = _Harness()
 
     assert player._synth3d_note_cut_boundary(1200.0) is True
-    assert player._synth3d_note_cut_boundary(1500.0) is False
+    assert player._synth3d_note_cut_boundary(1500.0) is True   # was dropped
     assert player._synth3d_note_cut_boundary(900.0) is True
-    assert player._synth3d_pending_cut_pts == 900.0
+    assert player._synth3d_pending_cuts == [900.0, 1200.0, 1500.0]
+
+    # Duplicates within half a millisecond are the same cut reported twice.
+    assert player._synth3d_note_cut_boundary(1200.3) is False
 
     player._synth3d_matte_cut_seen_ms = 900.0
     assert player._synth3d_note_cut_boundary(900.2) is False
     assert player._synth3d_note_cut_boundary(-1) is False
 
 
+def test_pending_cut_queue_is_bounded_and_counts_what_it_drops():
+    player = _Harness()
+    for index in range(player.SYNTH3D_MAX_PENDING_CUTS + 3):
+        assert player._synth3d_note_cut_boundary(1000.0 + index * 50.0) is True
+    assert len(player._synth3d_pending_cuts) == player.SYNTH3D_MAX_PENDING_CUTS
+    # Silent loss is what hid the original defect; a drop must leave a trace.
+    assert player._synth3d_cuts_dropped == 3
+    # The IMMINENT cut must survive: the advisory pump reports the nearest one
+    # every 100 ms, so evicting it re-adds and re-evicts it at pump cadence --
+    # measured at 10 drops/second before the eviction end was corrected.
+    assert player._synth3d_pending_cuts[0] == 1000.0
+
+
+def test_re_noting_the_imminent_cut_never_churns_the_queue():
+    player = _Harness()
+    for index in range(player.SYNTH3D_MAX_PENDING_CUTS):
+        assert player._synth3d_note_cut_boundary(1000.0 + index * 50.0) is True
+    nearest = player._synth3d_pending_cuts[0]
+    # What the 100 ms pump does: re-report the nearest cut, over and over.
+    for _ in range(50):
+        assert player._synth3d_note_cut_boundary(nearest) is False
+    assert getattr(player, '_synth3d_cuts_dropped', 0) == 0
+    assert player._synth3d_pending_cuts[0] == nearest
+
+
 def test_matte_epoch_advances_only_when_cut_reaches_presentation():
     player = _Harness()
     service = _MatteService()
-    player._synth3d_pending_cut_pts = 1000.0
+    player._synth3d_pending_cuts = [1000.0]
 
     assert player._synth3d_apply_matte_cut_if_due(999.4, service) is False
     assert service.resets == []
 
     assert player._synth3d_apply_matte_cut_if_due(999.5, service) is True
     assert service.resets == ['shot boundary @1000.000 ms']
-    assert player._synth3d_pending_cut_pts is None
+    assert player._synth3d_pending_cuts == []
     assert player._synth3d_matte_cut_seen_ms == 1000.0
     assert player._synth3d_matte_floor_pts_ms == 1000.0
     assert player.cleared == 1
@@ -143,6 +176,23 @@ def test_named_preset_updates_settings_and_renderer():
     assert player.saved == 1
     assert player.pushed == 1
     assert player.notifications[-1] == ('2D->3D preset: Cinema', True)
+
+
+def test_retired_immersion_preset_migrates_to_cinema_and_is_not_selectable():
+    assert Synth3DCoordinationMixin._normalise_synth3d_preset(
+        'immersion') == 'cinema'
+    assert Synth3DCoordinationMixin._normalise_synth3d_preset(
+        'unknown') == 'custom'
+    assert set(Synth3DCoordinationMixin._SYNTH3D_PRESETS) == {
+        'comfort', 'cinema'}
+
+    player = _Harness()
+    before = (player._synth3d_preset, player._synth3d_strength,
+              player._synth3d_convergence, player.saved, player.pushed)
+    player.apply_synth3d_preset('immersion')
+    after = (player._synth3d_preset, player._synth3d_strength,
+             player._synth3d_convergence, player.saved, player.pushed)
+    assert after == before
 
 
 def test_decoder_restart_does_not_report_native_path_loss():
@@ -201,3 +251,32 @@ if __name__ == '__main__':
     import unittest
 
     unittest.main()
+
+
+def test_queued_cuts_drain_one_per_presentation():
+    player = _Harness()
+    service = _MatteService()
+    player._synth3d_note_cut_boundary(1000.0)
+    player._synth3d_note_cut_boundary(1200.0)
+
+    assert player._synth3d_apply_matte_cut_if_due(1000.0, service) is True
+    assert player._synth3d_pending_cuts == [1200.0]
+    assert player._synth3d_apply_matte_cut_if_due(1200.0, service) is True
+    assert service.resets == ['shot boundary @1000.000 ms',
+                              'shot boundary @1200.000 ms']
+    assert player._synth3d_pending_cuts == []
+    assert getattr(player, '_synth3d_cuts_coalesced', 0) == 0
+
+
+def test_cuts_overtaken_by_presentation_coalesce_and_are_counted():
+    """Several due at once means their shots went by faster than the pump ran.
+    One reset is all that remains possible, but it must not look clean."""
+    player = _Harness()
+    service = _MatteService()
+    player._synth3d_note_cut_boundary(1000.0)
+    player._synth3d_note_cut_boundary(1200.0)
+
+    assert player._synth3d_apply_matte_cut_if_due(1500.0, service) is True
+    assert service.resets == ['shot boundary @1200.000 ms']
+    assert player._synth3d_cuts_coalesced == 1
+    assert player._synth3d_matte_cut_seen_ms == 1200.0

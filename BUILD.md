@@ -225,6 +225,20 @@ bundled, never referenced by the player. See its own `README.md`. The rule:
 only an artifact with a clean Apache-2.0 chain may live in `models/`;
 everything else goes there or is not downloaded at all.
 
+### Test suite
+
+```
+.venv\Scripts\python.exe -m pytest tests -q
+```
+
+**191 passing** at v5.3.1. Runs in ~3 s, needs no media and no GPU: the native
+pieces it covers are reached through the promoted `.pyd` in `runtime/`, so run
+it *after* copying a fresh build there, or it will silently qualify the previous
+binary. Native behaviour is pinned through pybind11 rather than described in
+comments -- `tests/test_cut_gate.py` covers the shot-cut gate, and
+`tests/test_hevc_pump_census.py` the presentation-token accounting whose absence
+hid a freeze for two evenings.
+
 ### Decode benchmark and bit-exactness gate
 
 `tools_dev/bench_decode.py` times the native MVC decode path with the access
@@ -276,6 +290,129 @@ hashes are unchanged by the gate at the reference 60-iteration sequence: on
 content without spurious crossings it alters nothing.
 `SYLC_SYNTH3D_DEPTHCUT_ADAPT=0` restores the fixed threshold exactly.
 
+### Stereo Lab rivalry matrix
+
+`tools_dev/probe_stereo_lab_rivalry_gpu.py` scores ONE synthetic topology of
+ONE binary: is the Lab better than the raw reference right now. That is not
+enough to qualify a change, and release claims written from ad-hoc runs of it
+drifted because their topology set was never written down.
+
+`tools_dev/lab_chroma_matrix.py` fixes the protocol in code -- seeds
+20260807..20260814 at 640x360, strength 2.4, convergence 0.5 -- and compares
+against the committed `tools_dev/lab_chroma_baseline.json`. Run it after any
+change to `mvc_realtime_demuxer/shaders/stereo_lab.hlsl`.
+
+Ordinary runs fail closed before launching D3D11 unless the baseline protocol,
+ordered seed list and baseline rows match exactly.  Removing, adding,
+duplicating or reordering a topology is therefore a contract failure, including
+for the two known-red seeds.  `--update-baseline` is the sole explicit path for
+an intentional protocol change and must remain coupled to its release note.
+
+```bat
+.venv\Scripts\python.exe tools_dev\lab_chroma_matrix.py
+.venv\Scripts\python.exe tools_dev\lab_chroma_matrix.py --update-baseline
+```
+
+Three criteria, scored separately because one p95 gate hid the other two:
+
+- **lab_vs_raw** -- the probe's own verdict inside this build.
+- **old_vs_new** -- every metric against the committed baseline. The only
+  criterion that can attribute a regression to a commit, and the reason the
+  baseline file is committed rather than regenerated per run. Re-record it
+  only deliberately, in the same change that justifies the movement.
+- **strong_error** -- p99, the >8 / >16 code-value rates, and the `touched_*`
+  columns: the amplitude of what the Lab actually WROTE. Read these, not the
+  zone percentiles, when judging an image-quality change.
+
+**Why the zone percentiles cannot judge a Lab change.** The Lab leaves 97-98%
+of the rivalry zone bit-identical and writes 20-120 samples. A p95 over
+~1500 samples is therefore set by samples the Lab never touched -- and when
+its written samples jump to the top of the ranking they displace the entire
+tail, so the p95 reports that **rank shift** as if it were a degradation at
+the p95 level. Proof: excluding the written samples makes raw and Lab p95
+identical to four decimals (0.6302 on seed 20260809, 0.7304 on 20260811).
+The probe asserts this as `untouched_p95_match`; if it ever goes false, the
+percentiles have to be re-interpreted rather than merely re-read.
+
+This is not academic. Two correct shader fixes were scored as failures by the
+p95 gate before the `chroma_touched` block existed, and one of them was
+discarded on that evidence before being recovered.
+
+Seeds 20260809 and 20260811 stay **known-red** so the matrix cannot go green
+by deleting an inconvenient topology, but their annotation records what is
+actually true: both fail on the rank artifact, and on 20260811 the Lab is net
+POSITIVE where it writes (30 improved vs 20 degraded). The residual real
+defect is on 20260809 -- 28 written samples in chroma columns 87-89, worst
+17.6 code values.
+
+The stage was isolated by bisect: neutralizing `provenance_locked_chroma` or
+the chroma disocclusion repair leaves their paired chroma p95 bit-identical,
+while neutralizing `corrected_sample` makes it equal the raw reference
+exactly. `chroma_footprint_agreement` addresses it: the provenance map is
+full-luma, so one 4:2:0 chroma sample covers a 2x2 luma cell, and while
+`chroma_footprint_guard` made the guard footprint-exact, the source owner the
+guard converges TOWARD was still read at one corner. Reading the opposite
+corner merely relocates the error -- measured -- which proves no corner is
+right, so a straddling cell is refused instead. Measured across the recorded
+set: 36 harmful corrections refused for zero useful ones lost, worst sample
+down on three topologies (22.94 -> 0.98, 36.04 -> 17.56, 29.91 -> 20.28) and
+up on none.
+
+### Shot-cut detection: reading the `bnd_*` counters
+
+Shot cuts reset the temporal state. Three legs feed that decision, and until
+2026-08-08 none of them could be observed, so a lost cut looked exactly like a
+cut that was never there.
+
+- **Scout (primary).** `lookahead_scout.py` analyses decoded-FUTURE frames at
+  64 px and publishes the boundary before presentation. This is the leg that
+  does the work.
+- **Source histogram (`CutGate`).** A fallback on the depth worker's own input.
+- **Depth residual.** Inside `DepthStabilizer::step()`.
+
+**Do not chase `cut_src`.** `cut_gate.update(cur.boundary_cut, ...)` takes the
+scout's verdict as its first argument and returns immediately when it is set,
+and the counters are a priority chain (`boundary` else `source` else `depth`).
+Whenever the scout sees the cut — the normal case — the verdict is attributed
+to `cut_bnd`, so `cut_src` reads 0 by construction. Three fixes were spent
+chasing that zero before this was understood.
+
+**The counters that do answer the question:**
+
+| field | meaning |
+|---|---|
+| `bnd_rec` | boundaries accepted as new |
+| `bnd_mrg` | merged into an existing one (21 ms window: scout and worker reporting the same cut) |
+| `bnd_late` | recorded at a pts the worker had ALREADY consumed past |
+| `bnd_carry` | late boundaries applied to the next observation instead of being lost |
+| `bnd_exp` | pruned at the 4 s horizon **without ever being crossed** — a cut seen and dropped |
+| `late_ms` | worst lateness since the last line |
+| `scene_max` | peak histogram distance since the last line (`scene=` is an instantaneous sample and lands on a cut frame essentially never) |
+
+**The defect these found.** `cross_shot_gate` requires strict interval
+containment: `previous < boundary && current >= boundary`. The scout dates a
+cut at the NEW shot's first frame, which is the frame the worker has just
+consumed, so `previous < boundary` fails for every subsequent interval and the
+boundary is born dead. Measured lateness: 0 to 42 ms — zero to one frame at
+23.976, never seconds. Measured loss: `bnd_exp=20` of `bnd_rec=98`, one cut in
+five detected, published, recorded, and never acted on.
+
+A boundary late by less than `kLateBoundaryGraceMs` (120 ms) is now carried to
+the next observation. After: `bnd_exp=1` of `bnd_rec=39` with `bnd_carry=35`,
+and every recorded boundary consumed. The bound is what keeps a genuinely old
+boundary from snapping in the middle of the following shot.
+
+`tools_dev/cut_trace.py` replays the two source-image legs offline over any
+film, which is how the `CutGate` rule was found to confirm 0 of 30 real hard
+cuts before it was replaced.
+
+`tools_dev/calibrate_transport_confidence.py` re-fits the matte contour-lock
+confidence weights against ground truth rather than by moving
+`CONTOUR_MIN_CONFIDENCE` (0.68, in `synth3d_matting_service.py` -- the only
+executable copy of that threshold) until the symptom goes away. Use it whenever
+a term is added to or removed from the transport score; a threshold tuned
+against weights that no longer mean the same thing is not a calibration.
+
 ### Reading `pass_ms` and `taplat_ms` in the `[2D3D]` line
 
 `inwait_ms/reswait_ms/joinwait_ms/cycle_ms` close the worker's cycle to the
@@ -304,6 +441,54 @@ was 43.5 vs 52.9 and delivered 23.1 vs 18.9 maps/s. The whole 9.4 ms delta sat
 in `inwait_ms`. Compute, GPU (`reswait_ms` = 0.00), readback (`dstall` 0.06 -
 0.15 %) and source were all eliminated; `duppts` accounted for only 1.6 ms of
 it. `pass_ms` and `taplat_ms` exist to close that remaining gap.
+
+### Diagnosing a freeze (image stops, audio continues)
+
+```
+python tools_dev/freeze_triage.py <player.log>
+```
+
+Reads the `[2D3D]`, `[LOOKAHEAD]` and `[PUMP]` lines together, anchors its
+window on the freeze itself and names the stage that stopped. The window
+matters: measured over a whole log, a twenty-second freeze inside ten minutes of
+healthy playback averages away to nothing, and that is exactly how the first
+reading of this signal came out as "the renderer stopped" when the renderer had
+merely been locked out.
+
+The stages are chained by back-pressure, so each one looks identical from the
+outside -- alive, idle, waiting. Four fields separate them, and no two of them
+suffice:
+
+| field | source | what it settles |
+|---|---|---|
+| `age_ms` | `[2D3D]` | age of the *published* depth map. This IS the freeze, whatever the cause. Anchor on it. |
+| `taps` / `busy` | `[2D3D]` | `taps` counts every `wants_input()` call, `busy` the subset refused because the worker still owes the previous map. Both climbing = the renderer is asking and the WORKER owes it. `taps` flat = the renderer really stopped. |
+| `wphase` | `[2D3D]` | the region of `worker_main` last *entered*; never cleared back to `run`, so the phase is the region and its age is the time spent there. `input` with a small age = spinning on the 100 ms timeout, i.e. starving, not blocked. |
+| `[PUMP] emitted`/`acked` | decode thread | delivery tokens taken vs acknowledged. A gap that does not close means queued invocations are being lost. |
+
+Why `busy` had to be added: `SharedDepthService::wants_input()` refuses a frame
+with `if (input_fresh_) return false;` when the worker has not taken the
+previous map, and that refusal used to move **no counter at all**. A stalled
+worker (renderer locked out) and a stalled renderer (worker starving) therefore
+wrote byte-identical logs -- `grants`, `submits` and `duppts` flat in both
+cases. Every hypothesis built on those counters was unfalsifiable.
+
+`ipipe=` describes the inference thread only. It previously also carried marks
+written by the *worker* thread from `InferPipe::submit()`/`wait_result()`, on
+the same pair of atomics, so a reader could pick up one thread's phase with the
+other's timestamp -- a misreading that cost a full reproduction cycle.
+
+Reset accounting, on the same line: `rst=seek:geometry:attach` (requested, by
+cause), `mrst=` (consumed by the worker), `mdrop=` (in-flight maps discarded).
+A reset makes the worker throw away the map in flight, so a reset storm freezes
+the picture without blocking anything -- a state no other counter can tell apart
+from a deadlock.
+
+The `[PUMP]` line is quiet in health (one line per 30 s) and speaks at once when
+a delivery token outlives its expiry. `expired=` counts tokens reclaimed by the
+`TOKEN_EXPIRY_S` guard: **a non-zero value is a defect that is being survived,
+not a defect that is fixed**, and `emitted - acked` keeps measuring the
+underlying loss because the guard never forges an acknowledgement.
 
 ### Adaptive aspect benchmark
 
@@ -924,9 +1109,17 @@ mpv-2 / ffprobe + av*/sw* as data files; ebml, matroska and the
 `.pyd` are auto-bundled by Nuitka's dependency scan). The `build_nuitka/` output is
 git-ignored — rebuild via `scripts\build\build_exe_v530.bat`.
 
-**`scripts/build/build_exe_onefile.bat` is not part of the v5.3.0 release.** It still carries
+**The `v530` in the script name is historical.** It is the current release
+script and stamps `--file-version=5.3.1 --product-version=5.3.1`; the version
+of a build comes from those flags, not from the filename. The same applies to
+its `--output-dir=build_release_v530` and to `tools_dev/make_github_release.py`'s
+`--dest GitHub_v530` default. Renaming them would touch `.gitignore`, this file,
+`README.md`, `docs/PROJECT_LAYOUT.md` and `wiki/Building-from-Source.md`, so the
+names are kept and documented instead of quietly drifting.
+
+**`scripts/build/build_exe_onefile.bat` is not part of the v5.3.1 release.** It still carries
 v5.0.0 version stamps throughout and predates the 2D→3D packaging whitelist, so
 it bundles neither `onnxruntime.dll`, `DirectML.dll`, `models/MANIFEST.json` nor
 `model_fetcher` / `model_download_dialog`: a binary built from it plays video but
 answers `models/MANIFEST.json is missing from this install` to every AI action.
-v5.3.0 ships a single asset, the portable folder from `scripts/build/build_exe_v530.bat`.
+v5.3.1 ships a single asset, the portable folder from `scripts/build/build_exe_v530.bat`.

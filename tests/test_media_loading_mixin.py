@@ -65,6 +65,25 @@ def test_mpv_source_prefers_continuous_feature_edl():
     assert player._mpv_source_for('segment.ssif') == 'edl://feature'
 
 
+def test_media_title_uses_original_human_source_name():
+    player = _Harness()
+    titles = []
+    player.setWindowTitle = titles.append
+    player._pending_media_display_title = 'Oblivion (2013)'
+
+    player._set_media_window_title(r'D:\BDMV\STREAM\00001.ssif')
+
+    assert titles == ['Oblivion (2013) — SyLC 3D Player']
+
+
+def test_media_display_name_handles_files_isos_and_bdmv_folders():
+    display = MediaLoadingMixin._media_display_name
+
+    assert display(r'C:\Movies\Oblivion.2013.mkv') == 'Oblivion.2013'
+    assert display(r'C:\Images\Avatar 3D.iso') == 'Avatar 3D'
+    assert display(r'C:\Discs\Avatar\BDMV') == 'Avatar'
+
+
 def test_play_file_contains_unhandled_load_failures():
     player = _Harness()
     player._play_file_impl = lambda *_args: (_ for _ in ()).throw(
@@ -135,4 +154,3 @@ def test_pgs_timeout_cancels_only_current_pending_startup():
     assert player._media_cancel_event.is_set()
     assert player.aborts[-1][0] == 7
     assert player.loading_overlay.hidden == 1
-

@@ -1,0 +1,66 @@
+{
+  "video": "H:\\Newsleecher\\Oblivion.2013.MULTi.TRUEFRENCH.1080p.BluRay.x264-ROUGH\\Oblivion.2013.MULTi.TRUEFRENCH.1080p.BluRay.x264-ROUGH.mkv",
+  "seek_s": 1800.0,
+  "source_fps": 23.976023976023978,
+  "future_frames": 1,
+  "preset": "quality",
+  "grid": [
+    756,
+    322
+  ],
+  "strength_pct": 1.5,
+  "convergence": 0.5,
+  "provider": "NVOFA/CUDA + DepthEngine",
+  "timings": {
+    "decode_ms": {
+      "median": 162.33890000148676,
+      "p95": 162.33890000148676,
+      "min": 162.33890000148676,
+      "max": 162.33890000148676
+    },
+    "depth_current_cold_ms": {
+      "median": 4063.948499999242,
+      "p95": 4063.948499999242,
+      "min": 4063.948499999242,
+      "max": 4063.948499999242
+    },
+    "depth_future_cold_ms": {
+      "median": 3747.9991000000155,
+      "p95": 3747.9991000000155,
+      "min": 3747.9991000000155,
+      "max": 3747.9991000000155
+    },
+    "flow_init_ms": {
+      "median": 111.92989999835845,
+      "p95": 111.92989999835845,
+      "min": 111.92989999835845,
+      "max": 111.92989999835845
+    },
+    "flow_ms": {
+      "median": 8.877200001734309,
+      "p95": 8.877200001734309,
+      "min": 8.877200001734309,
+      "max": 8.877200001734309
+    },
+    "reconstruct_ms": {
+      "median": 159.76250000676373,
+      "p95": 159.76250000676373,
+      "min": 159.76250000676373,
+      "max": 159.76250000676373
+    }
+  },
+  "metrics": {
+    "hole_pixels": 9129.0,
+    "hole_pct": 1.8750616188504388,
+    "lookahead_pixels": 4074.0,
+    "lookahead_coverage_pct": 44.627012816299704,
+    "lookahead_confidence_mean": 0.5017457604408264,
+    "flow_reliability_mean": 0.9395276308059692,
+    "flow_valid_pct": 100.0,
+    "flow_magnitude_mean_px": 8.65688705444336,
+    "lookahead_delay_ms": 41.70833333333333
+  },
+  "artifacts": {
+    "contact_sheet": "I:\\SyLC_Final\\tools_dev\\lookahead_oblivion_1800s_nvof_persistent\\lookahead_ab.png"
+  }
+}

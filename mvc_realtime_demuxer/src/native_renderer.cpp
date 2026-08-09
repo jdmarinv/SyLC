@@ -1045,9 +1045,12 @@ bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float converg
         last_error_ = "set_synth3d: invalid calibrated comfort envelope";
         return false;
     }
-    p.comfort_enabled = false;
-    p.comfort_soft_pct = 0.0f;
-    p.comfort_hard_pct = 0.0f;
+    // The calibrated envelope is consumed once by Synth3D's authoritative
+    // disparity function. Stereo Lab sees the same parameters for passive
+    // audit metrics; it does not perform a second geometric warp.
+    p.comfort_enabled = comfort_enabled;
+    p.comfort_soft_pct = comfort_enabled ? comfort_soft_pct : 0.0f;
+    p.comfort_hard_pct = comfort_enabled ? comfort_hard_pct : 0.0f;
     p.depth_view   = depth_view;
     p.diagnostics  = diagnostics;
     p.model_path   = model_path;

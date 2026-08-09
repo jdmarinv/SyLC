@@ -711,7 +711,7 @@ class PlaybackTimelineMixin:
                 else:
                     try:
                         mpv_pos = self.player.time_pos
-                    except:
+                    except Exception:
                         pass
 
             # V7b++++++ CRITICAL SYNC FIX: Continuously update decoder's audio clock
@@ -926,7 +926,7 @@ class PlaybackTimelineMixin:
                 # CRITICAL FIX: Directly handle pause change to ensure immediate video stop
                 # Relying solely on MPV callback can be unreliable if MPV thread is busy
                 self._handle_pause_change(new_pause)
-            except:
+            except Exception:
                 pass
 
     def _set_playback_stopped_ui(self):

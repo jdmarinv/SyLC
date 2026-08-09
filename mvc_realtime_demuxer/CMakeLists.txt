@@ -583,6 +583,7 @@ if(BUILD_NATIVE_RENDERER)
     sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_LOCAL_CSO synth3d_cs_owner_local "${_synth_owner_hlsl}" CS_OwnerLocal cs_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_PROPAGATE_CSO synth3d_cs_owner_propagate "${_synth_owner_hlsl}" CS_OwnerPropagate cs_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_COMPOSE_CSO synth3d_cs_owner_compose "${_synth_owner_hlsl}" CS_OwnerCompose cs_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_SAFETY_TEMPORAL_CSO synth3d_cs_owner_safety_temporal "${_synth_owner_hlsl}" CS_OwnerSafetyTemporal cs_5_0)
     sylc_compile_hlsl(SYLC_STEREO_LAB_PS_LUMA_CSO stereo_lab_ps_luma "${_stereo_lab_hlsl}" PS_LabLuma ps_5_0)
     sylc_compile_hlsl(SYLC_STEREO_LAB_PS_CHROMA_CSO stereo_lab_ps_chroma "${_stereo_lab_hlsl}" PS_LabChroma ps_5_0)
     sylc_compile_hlsl(SYLC_STEREO_LAB_PS_METRICS_CSO stereo_lab_ps_metrics "${_stereo_lab_hlsl}" PS_LabMetrics ps_5_0)
@@ -602,6 +603,7 @@ if(BUILD_NATIVE_RENDERER)
         "${SYLC_SYNTH3D_CS_OWNER_LOCAL_CSO}"
         "${SYLC_SYNTH3D_CS_OWNER_PROPAGATE_CSO}"
         "${SYLC_SYNTH3D_CS_OWNER_COMPOSE_CSO}"
+        "${SYLC_SYNTH3D_CS_OWNER_SAFETY_TEMPORAL_CSO}"
         "${SYLC_STEREO_LAB_PS_LUMA_CSO}"
         "${SYLC_STEREO_LAB_PS_CHROMA_CSO}"
         "${SYLC_STEREO_LAB_PS_METRICS_CSO}"
@@ -630,6 +632,9 @@ if(BUILD_NATIVE_RENDERER)
     # synth3d: temporal depth stabilizer (fit scale/shift + EMA + scene-cut snap
     # + percentile normalization). Pure C++ math, no ORT/D3D dependency.
     target_sources(mvc_demuxer_cpp PRIVATE src/depth_stabilizer.cpp)
+    # Post-normalization three-band temporal memory plus the conservative CPU
+    # fallback for the GPU safety-release envelope.
+    target_sources(mvc_demuxer_cpp PRIVATE src/synth3d_temporal_filter.cpp)
     # One process-wide inference/stabilization service shared by every renderer
     # surface. GPU warp resources remain device-local; the immutable depth map
     # and ORT session do not.

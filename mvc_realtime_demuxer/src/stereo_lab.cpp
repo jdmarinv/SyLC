@@ -16,7 +16,26 @@ namespace {
 
 constexpr uint32_t kMetricWidth = 96;
 constexpr uint32_t kMetricHeight = 54;
-constexpr uint64_t kMetricInterval = 15;
+// Every 15 frames is right for a status line; it cannot resolve whether a
+// localised correction TOGGLES between frames, which is the difference
+// between "the Lab flickers" and "the depth moves under a stable Lab" --
+// opposite defects needing opposite fixes.  SYLC_STEREO_LAB_METRIC_EVERY=1
+// pays a readback per frame to answer that, for a diagnostic run only.
+static uint64_t metric_interval() {
+    static const uint64_t value = []() -> uint64_t {
+        char* env = nullptr;   // house idiom (MSVC-safe)
+        size_t len = 0;
+        uint64_t interval = 15;
+        if (_dupenv_s(&env, &len, "SYLC_STEREO_LAB_METRIC_EVERY") == 0 && env) {
+            const long parsed = std::strtol(env, nullptr, 10);
+            if (parsed >= 1 && parsed <= 240)
+                interval = static_cast<uint64_t>(parsed);
+            free(env);
+        }
+        return interval;
+    }();
+    return value;
+}
 constexpr uint32_t kPairFieldMaxWidth = 192;
 
 struct LabCB {
@@ -479,7 +498,7 @@ bool StereoLab::process(ID3D11Device* device, ID3D11DeviceContext* ctx,
     }
 
     ++frame_counter_;
-    if (frame_counter_ % kMetricInterval == 0) {
+    if (frame_counter_ % metric_interval() == 0) {
         drain_metrics(ctx);
         if (!metric_pending_) {
             ID3D11RenderTargetView* rtv = metric_rtv_.Get();

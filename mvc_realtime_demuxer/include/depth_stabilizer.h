@@ -79,7 +79,8 @@ public:
     bool step(const float* raw, uint16_t* out_q16,
               const float* motion = nullptr, float scene_change = 0.0f,
               const float* confidence = nullptr,
-              const float* surface_boundary = nullptr);
+              const float* surface_boundary = nullptr,
+              const float* fine_structure = nullptr);
 
     float alpha = 0.2f;            // EMA blend
     float alpha_static = 0.12f;    // adaptive EMA floor (motion == 0)
@@ -89,6 +90,13 @@ public:
     float motion_low = 0.015f;     // luma delta below this is treated as static
     float motion_high = 0.12f;     // luma delta above this accepts quickly
     float tone_alpha = 0.06f;      // slow per-shot depth-range adaptation
+    float tone_expand_rate = 0.20f;// faster expansion toward newly seen extrema
+    float tone_max_step_frac = 0.04f; // per-reference-interval range cap
+    float tone_prime_margin = 0.0f; // extra fraction of initial range per side
+    // Diagnostic/controlled mode: retain the range established at prime/cut
+    // while continuing every per-pixel temporal update. This isolates global
+    // percentile-range breathing from genuine local depth evolution.
+    bool tone_lock = false;
     float depth_contrast = 0.82f;  // soft depth-budget compression about 0.5
     // Gentle monotonic S-curve before depth_contrast: separates middle planes
     // while the existing headroom still protects the near/far extremes.
@@ -111,6 +119,12 @@ public:
     float temporal_stable_low = 0.45f;
     float temporal_stable_high = 0.75f;
     float boundary_fast_motion = 0.035f;
+    // Hair, wire and spokes sit on two image edges at once. Motion from the
+    // background on either side is expanded onto their grid texel, but must
+    // not immediately discard the filament's temporal majority. A score of
+    // one discounts 85% of moderate contamination; genuinely strong motion
+    // still reaches boundary_fast_motion and takes the fast path.
+    float fine_structure_motion_discount = 0.85f;
     // Two-cycle same-sign outlier confirmation ("snap"). A per-pixel EMA
     // time-averages DA3's independent per-inference edge placement jitter
     // (+/-1-2 texels on an otherwise static contour) into a soft spatial

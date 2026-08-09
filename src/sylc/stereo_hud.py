@@ -87,6 +87,16 @@ class StereoHudController(QObject):
         """Keep auto-hide suspended during a drag or while a HUD menu is open."""
         return bool(self.interacting or self._popup is not None)
 
+    @staticmethod
+    def _thumbnail_uses_hud(active, hide_native):
+        """Whether hover thumbnails must be painted into the stereo texture.
+
+        With an external FramePack/eye window, the native controls remain in
+        the main window and their correctly positioned 2D tooltip is useful.
+        Only suppress it when the HUD replaces the main-window overlay itself.
+        """
+        return bool(active and hide_native)
+
     def sync(self, force=False):
         mode = str(getattr(self.host, "current_stereo_mode", "")).lower()
         enabled = bool(getattr(self.host, "has_media", False)
@@ -144,13 +154,14 @@ class StereoHudController(QObject):
 
         time_slider = getattr(self.overlay, 'time_slider', None)
         if time_slider:
-            # La preview native est une fenêtre Tool 2D positionnée en
-            # coordonnées de la fenêtre principale : HUD actif (mono OU
-            # pilote/FramePack), elle surgirait mal placée et en un seul
-            # exemplaire par-dessus la sortie 3D. La vignette est composée
-            # DANS la texture HUD à la place (chaque œil, alignée au survol).
-            time_slider.setProperty('hud_mode', self.active)
-            if self.active and hasattr(time_slider, '_preview_widget'):
+            # Suppress the native tooltip only when the stereo HUD replaces
+            # the main-window overlay. In FramePack/external-eye layouts the
+            # native bar remains in the main window, so its thumbnail belongs
+            # there and can be shown alongside the stereo HUD copy.
+            thumbnail_hud = self._thumbnail_uses_hud(
+                self.active, hide_native)
+            time_slider.setProperty('hud_mode', thumbnail_hud)
+            if thumbnail_hud and hasattr(time_slider, '_preview_widget'):
                 time_slider._preview_widget.hide()
 
         was_dont_show = self.overlay.testAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)

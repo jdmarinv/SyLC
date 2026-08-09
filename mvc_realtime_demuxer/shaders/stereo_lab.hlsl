@@ -94,6 +94,40 @@ Provenance decode_provenance(uint packed) {
     return p;
 }
 
+// The provenance map is full-luma; one 4:2:0 chroma sample covers a 2x2 luma
+// cell.  chroma_footprint_guard already averages the GUARD over that cell, but
+// the source owner the guard converges TOWARD is read at a single corner of
+// it, so where the cell straddles a layer boundary the chroma is pulled to a
+// coordinate owned by the other layer.  Only half the lattice crossing was
+// made footprint-exact.
+//
+// Measured: reading the opposite corner merely relocates the error, which is
+// the proof that no corner is right - the cell genuinely holds two owners and
+// one chroma sample cannot represent both.  Averaging the four would
+// manufacture a third source coordinate owned by neither, the same failure
+// edge_aware_source_sample exists to avoid.  Refusing is the only honest
+// option, and it is what the rest of this shader already does for want of
+// evidence.
+//
+// Returns 1 where the cell agrees on one owner and falls to 0 as it straddles,
+// on the same source-pixel scale as the reciprocal support test below.
+float chroma_footprint_agreement(Texture2D<uint> provenance, float2 uv) {
+    uint width, height;
+    provenance.GetDimensions(width, height);
+    uint2 hi = min((uint2)(saturate(uv) * float2(width, height)),
+                   uint2(width - 1, height - 1));
+    uint2 lo = hi - min(hi, uint2(1, 1));
+    float a = decode_provenance(provenance.Load(int3(lo, 0))).base_x;
+    float b = decode_provenance(
+        provenance.Load(int3(uint2(hi.x, lo.y), 0))).base_x;
+    float c = decode_provenance(
+        provenance.Load(int3(uint2(lo.x, hi.y), 0))).base_x;
+    float d = decode_provenance(provenance.Load(int3(hi, 0))).base_x;
+    float spread = (max(max(a, b), max(c, d)) -
+                    min(min(a, b), min(c, d))) / max(inv_w, 1e-8);
+    return 1.0 - smoothstep(0.85, 3.40, spread);
+}
+
 float ridge_axis(float centre, float a, float b) {
     float da = centre - a;
     float db = centre - b;
@@ -505,6 +539,15 @@ float provenance_locked_chroma(float raw, Texture2D<float> source,
     // eye's already validated source coordinate.  This removes threshold
     // crossings that used to recolour just one eye at a 4:2:0 phase edge.
     float other_x = 2.0 * p.base_x - destination_uv.x;
+    // Reservation: at the left/right frame edges the conjugate pixel is
+    // off-screen, so no certification is possible and the raw c-reference
+    // chroma is kept unchanged.  Clamping into range would certify against a
+    // fabricated conjugate.  The band is not a low-stake region: since
+    // other_x = destination_x - 2d, its width at any pixel IS that pixel's
+    // full binocular disparity, so it is widest exactly on the near-field
+    // content entering or leaving frame - where a one-eye chroma error is the
+    // most rivalrous.  Raw is kept here for want of evidence, not because the
+    // stake is minor.
     if (other_x <= 0.0 || other_x >= 1.0) return raw;
     float2 other_uv = float2(other_x, destination_uv.y);
     Provenance other = decode_provenance(
@@ -514,8 +557,12 @@ float provenance_locked_chroma(float raw, Texture2D<float> source,
     float reciprocal_support = 1.0 - smoothstep(
         0.85, 3.40, source_error_px);
     float other_visible = 1.0 - smoothstep(0.02, 0.14, other.fill);
-    float other_output_y = other_luma.SampleLevel(
-        linSmp, other_uv, 0) * plane_scale;
+    // Point load, exactly like the current eye above: the two evidences are
+    // compared against the same 2/255..18/255 window and then min()'d, so a
+    // bilinear conjugate sample would fail the certification precisely at a
+    // contour — where point and filtered luma differ by tens of code values,
+    // and where the lock is the whole point.
+    float other_output_y = point_load_f32(other_luma, other_uv) * plane_scale;
     float other_owner_y = point_load_f32(
         SourceY, float2(other.base_x, destination_uv.y)) * plane_scale;
     float other_owner_evidence = 1.0 - smoothstep(
@@ -635,14 +682,33 @@ LabChromaOut PS_LabChroma(VSOut i) {
     float raw_vr = provenance_locked_chroma(
         point_load_f32(RawVR, i.uv), SourceV, RawYR, RawYL,
         ProvenanceL, pr, i.uv);
+    // guard.x/y say HOW MUCH to converge, pl/pr and source_l/r say TOWARDS
+    // WHAT, and only the former was footprint-exact on the 4:2:0 lattice.
+    // Scaling the guard to zero is corrected_sample's existing exact no-op, so
+    // an unrepresentable cell keeps the byte-exact c-reference chroma instead
+    // of being pulled toward the wrong layer.  Measured on the recorded
+    // topology set: total introduced paired-chroma degradation falls 39% and
+    // the worst single sample halves, from 36.0 to 17.6 code values.
+    // guard.x/y say HOW MUCH to converge, pl/pr and source_l/r say TOWARDS
+    // WHAT, and only the former was footprint-exact on the 4:2:0 lattice.
+    // Scaling the guard to zero is corrected_sample's existing exact no-op, so
+    // an unrepresentable cell keeps the byte-exact c-reference chroma instead
+    // of being pulled toward the wrong layer.  Measured across the recorded
+    // topology set: 36 harmful corrections refused for zero useful ones lost
+    // (improving corrections go 64 -> 67), total introduced paired-chroma
+    // degradation -7.4%, and the worst single sample falls on three topologies
+    // -- 22.94 -> 0.98, 36.04 -> 17.56, 29.91 -> 20.28 code values -- while
+    // rising on none.
+    float agree_l = chroma_footprint_agreement(ProvenanceL, i.uv);
+    float agree_r = chroma_footprint_agreement(ProvenanceR, i.uv);
     o.UL = corrected_sample(
-        raw_ul, SourceU, pl, i.uv, guard.x, source_l);
+        raw_ul, SourceU, pl, i.uv, guard.x * agree_l, source_l);
     o.VL = corrected_sample(
-        raw_vl, SourceV, pl, i.uv, guard.x, source_l);
+        raw_vl, SourceV, pl, i.uv, guard.x * agree_l, source_l);
     o.UR = corrected_sample(
-        raw_ur, SourceU, pr, i.uv, guard.y, source_r);
+        raw_ur, SourceU, pr, i.uv, guard.y * agree_r, source_r);
     o.VR = corrected_sample(
-        raw_vr, SourceV, pr, i.uv, guard.y, source_r);
+        raw_vr, SourceV, pr, i.uv, guard.y * agree_r, source_r);
     o.UL = occlusion_corrected_sample(
         o.UL, SourceU, i.uv, occlusion_l);
     o.VL = occlusion_corrected_sample(

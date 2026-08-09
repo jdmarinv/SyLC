@@ -127,6 +127,16 @@ class MatteFrame:
     # alpha instead of keeping the first projection of the same network mask.
     transport_revision: int = 0
     tracking_confidence: float = 1.0
+    # The transport's OWN verdict on whether this matte may drive the full
+    # alpha reconstruction, rather than a scalar the renderer re-thresholds.
+    # The renderer used to compare tracking_confidence against a copy of the
+    # promotion threshold, which made one component span two modules: the
+    # constant existed three times, the service had to tune its score so the
+    # renderer's comparison landed on the intended side, and that tuning ran
+    # into a float boundary that no amount of care in the renderer could fix.
+    # A boolean has no boundary.  Default True: a fresh network observation is
+    # fully trusted, which is what tracking_confidence=1.0 used to express.
+    allow_contour: bool = True
     transport_kind: str = "network"
     # Per-pixel registration reliability in CURRENT-frame matte coordinates.
     # None denotes a fresh network observation and is therefore fully trusted.
@@ -170,6 +180,32 @@ class MatteAdvector:
     # Without current-frame evidence an asynchronous observation is safe only
     # within roughly one 24 fps frame. Older data is unknown, never background.
     FRESH_WITHOUT_TRANSPORT_MS = 45.0
+    # Age that never costs confidence, and the decay applied beyond it.  The
+    # floor is the historical constant: on a pipeline whose delivery latency is
+    # already under it, the score is unchanged.  See _age_grace_ms.
+    MIN_AGE_GRACE_MS = 120.0
+    AGE_DECAY_MS = 420.0
+    # The measured 4K path reaches 420 ms.  Half the 520 ms horizon left only
+    # a 0.683 age ceiling there, effectively requiring perfect image evidence
+    # to reach CONTOUR_MIN_CONFIDENCE below.  65% leaves useful evidence
+    # margin at that latency.
+    AGE_GRACE_HORIZON_RATIO = 0.65
+    # The evidence at which this transport promotes a matte from the
+    # conservative ownership guard to the full alpha reconstruction.  This is
+    # the service's own policy and exists once: the renderer consumes the
+    # resulting MatteFrame.allow_contour and holds no threshold of its own.
+    # The proportional cap above scales with _max_transport_ms while
+    # AGE_DECAY_MS does not, so a proportional cap alone let a tightened
+    # horizon paradoxically loosen promotion (a 300 ms horizon put the age term
+    # at 0.779 at expiry, above the threshold); the derived cap below fixes it.
+    CONTOUR_MIN_CONFIDENCE = 0.68
+    # Staleness at which the age term alone falls to CONTOUR_MIN_CONFIDENCE:
+    # exp(-(H - g) / AGE_DECAY_MS) <= threshold  <=>  g <= H - this margin.
+    AGE_GATE_MARGIN_MS = AGE_DECAY_MS * math.log(1.0 / CONTOUR_MIN_CONFIDENCE)
+    # Delivery latency is measured, not assumed.  A short median rejects a
+    # single late frame while still following a real cadence change within a
+    # second of playback.
+    ARRIVAL_SAMPLES = 8
 
     def __init__(self):
         self._steps = collections.deque(maxlen=self.MAX_STEPS)
@@ -213,6 +249,42 @@ class MatteAdvector:
         self._last_age_ms = 0.0
         self._last_error = ""
         self._rejected = 0
+        self._arrivals = collections.deque(maxlen=self.ARRIVAL_SAMPLES)
+        self._arrival_identity = None
+        self._last_grace_ms = self.MIN_AGE_GRACE_MS
+        self._last_allow_contour = True
+        self._last_terms = {}
+        # Engagement census.  A single status sample says nothing about a
+        # decision taken per displayed frame: six consecutive False readings
+        # are unremarkable at a 40% pass rate, and "contour never engages" and
+        # "contour engages intermittently" call for opposite work -- the
+        # second is also what makes a fringe SHIMMER rather than sit still.
+        self._contour_frames = 0
+        self._guard_frames = 0
+        # Rejection census by CAUSE.  81% of attempts are refused before the
+        # mode is even chosen, so the mode split describes a sixth of the
+        # story; the causes are what say whether the loss is the flow, the
+        # matte, or the ring.
+        self._reject_causes = {"empty_boundary": 0, "weak_evidence": 0,
+                               "no_luma_pair": 0, "over_horizon": 0,
+                               "no_mv_evidence": 0, "exception": 0}
+        # An empty boundary has two opposite causes and the counter cannot
+        # tell them apart: an alpha with nothing in it, or an alpha that
+        # fills the frame so its silhouette is off-screen. dilate == erode in
+        # both. The foreground fraction on those frames separates them.
+        self._empty_fg_fraction = []
+        # Empty-matte census against time since the model's last epoch reset.
+        # A defect and correct behaviour produce the same 76% figure: if the
+        # empties cluster in the first few hundred ms after a cut, the model is
+        # returning zeros while it re-seeds and that is repairable; if they are
+        # flat across the shot, there is simply no human on screen and nothing
+        # to fix. The counter cannot be read without this split.
+        self._epoch_generation = None
+        self._epoch_started_ms = None
+        self._epoch_bins = [100.0, 250.0, 500.0, 1000.0, 2500.0, 1e12]
+        self._epoch_empty = [0] * len(self._epoch_bins)
+        self._epoch_total = [0] * len(self._epoch_bins)
+        self._epoch_since_ms = -1.0
 
     @staticmethod
     def _u8_luma(y_plane: np.ndarray, sample_peak: Optional[int] = None) -> np.ndarray:
@@ -297,6 +369,12 @@ class MatteAdvector:
         self._last_kind = "reset"
         self._last_age_ms = 0.0
         self._last_error = ""
+        # A new epoch re-measures its own latency; one delivered matte is
+        # enough to leave the conservative default again.
+        self._arrivals.clear()
+        self._arrival_identity = None
+        self._last_grace_ms = self.MIN_AGE_GRACE_MS
+        self._last_allow_contour = True
 
     def status(self) -> dict:
         return {
@@ -308,11 +386,107 @@ class MatteAdvector:
             "lock_ms": self._last_lock_ms,
             "age_ms": self._last_age_ms,
             "max_age_ms": self._max_transport_ms,
+            "grace_ms": self._last_grace_ms,
+            # The published decision, not a score the consumer re-thresholds.
+            "allow_contour": self._last_allow_contour,
+            "contour_frames": self._contour_frames,
+            "guard_frames": self._guard_frames,
+            "reject_causes": dict(self._reject_causes),
+            "epoch_empty": list(self._epoch_empty),
+            "epoch_total": list(self._epoch_total),
+            "empty_fg": (
+                [round(float(np.percentile(self._empty_fg_fraction, q)), 4)
+                 for q in (5, 50, 95)] if self._empty_fg_fraction else []),
+            "terms": dict(self._last_terms),
             "error": self._last_error,
             "rejected": self._rejected,
             "track_side": self._track_side,
             "mode": self._lock_mode,
         }
+
+    def _note_arrival(self, matte: MatteFrame, video_time_ms: float) -> None:
+        """Sample this pipeline's own delivery latency, once per new matte."""
+        identity = (matte.sequence, matte.generation)
+        if identity == self._arrival_identity:
+            return
+        self._arrival_identity = identity
+        # At first sight the age IS the latency: nothing displayed since this
+        # mask was submitted could have produced a fresher one.  The first
+        # matte in an epoch therefore indexes its own grace immediately
+        # (subject to the floor and hard cap) and may pay no age penalty.  This
+        # benefit of the doubt is intentional: generation invalidation and the
+        # presentation-PTS floor have already rejected pre-cut/pre-seek masks,
+        # while current-frame photometric/FB evidence still gates transport.
+        age = float(video_time_ms) - float(matte.pts_ms)
+        if 0.0 <= age <= self._max_transport_ms:
+            self._arrivals.append(age)
+
+    def _note_epoch_outcome(self, empty: bool) -> None:
+        since = self._epoch_since_ms
+        if since < 0.0:
+            return
+        for index, edge in enumerate(self._epoch_bins):
+            if since < edge:
+                self._epoch_total[index] += 1
+                if empty:
+                    self._epoch_empty[index] += 1
+                return
+
+    def _age_grace_ms(self) -> float:
+        """Age that costs no confidence, indexed on the measured cadence.
+
+        A fixed 120 ms grace made ``exp(-(age-120)/420)`` a hard ceiling on the
+        score, so the 313-420 ms inference measured on the 4K/10-bit path could
+        not reach CONTOUR_MIN_CONFIDENCE whatever the image evidence
+        said — the full alpha reconstruction was closed by arithmetic on
+        exactly the content that motivated it.  The unavoidable part of the age
+        is the pipeline's own delivery latency, so only staleness ON TOP of
+        that is charged.  Capping the grace at 65% of the hard horizon leaves
+        useful image-evidence margin at the measured 420 ms upper latency: its
+        age ceiling is 0.823, so an otherwise-good 0.85 evidence term can still
+        cross the contour gate at full coverage.
+
+        The second cap keeps the horizon, not the score, as the binding
+        constraint at ANY configured horizon: AGE_GATE_MARGIN_MS is the
+        staleness needed for the age term to fall to CONTOUR_MIN_CONFIDENCE, so
+        a grace of H - that margin puts the term at the threshold on expiry,
+        and anything smaller puts it below.  At the 520 ms default the
+        proportional cap still binds (338 ms vs 358 ms) and behaviour is
+        unchanged: the age term at expiry is 0.648.
+
+        One documented limit: MIN_AGE_GRACE_MS is a floor, so the derived cap
+        can only be honoured while H - AGE_GATE_MARGIN_MS >= MIN_AGE_GRACE_MS,
+        i.e. above a ~282 ms horizon.  Below that the hard horizon is tighter
+        than the decay itself and dominates the outcome regardless.  The
+        promotion invariant does not rely on this cap arithmetically — see
+        _contour_age_limit_ms, which enforces it by construction.
+        """
+        if not self._arrivals:
+            return self.MIN_AGE_GRACE_MS
+        latency = float(np.median(np.asarray(self._arrivals, dtype=np.float64)))
+        return max(self.MIN_AGE_GRACE_MS,
+                   min(latency,
+                       self.AGE_GRACE_HORIZON_RATIO * self._max_transport_ms,
+                       self._max_transport_ms - self.AGE_GATE_MARGIN_MS))
+
+    def _contour_age_limit_ms(self, grace_ms: float) -> float:
+        """Age from which promotion is refused, whatever the image evidence.
+
+        The invariant is "a matte at the hard horizon never drives the full
+        reconstruction".  Expressing it as ``exp(-(H - g) / DECAY) <= T`` and
+        solving for g looked equivalent, but the exponential does not
+        round-trip: with g = H - AGE_GATE_MARGIN_MS the term evaluates to
+        0.6800000000000002 at 45 of the integer horizons where that cap binds,
+        one ulp above the threshold, which admits the very case the cap exists
+        to exclude.  Repairing that by nudging the margin buys well under an
+        ulp and is empirically clean at best.
+
+        Stating the invariant as an age comparison removes the question rather
+        than shrinking it.  min() against the horizon is exact in binary
+        floating point, and with a strict < the age_ms == horizon case is
+        refused by construction, at every horizon, with no epsilon anywhere.
+        """
+        return min(grace_ms + self.AGE_GATE_MARGIN_MS, self._max_transport_ms)
 
     def _frame_near(self, pts_ms: float):
         if not self._frames:
@@ -482,6 +656,7 @@ class MatteAdvector:
         base_item = self._frame_near(float(matte.pts_ms))
         current_item = self._frame_near(float(video_time_ms))
         if base_item is None or current_item is None:
+            self._reject_causes["no_luma_pair"] += 1
             return False, matte
         base_pts, base = base_item
         current_pts, current = current_item
@@ -489,6 +664,7 @@ class MatteAdvector:
             return False, matte
         age_ms = current_pts - base_pts
         if age_ms < -1.0 or age_ms > self._max_transport_ms:
+            self._reject_causes["over_horizon"] += 1
             return True, None
         if age_ms <= 1.0:
             return True, matte
@@ -559,16 +735,44 @@ class MatteAdvector:
         coverage = (float(np.mean(inside[boundary]))
                     if np.any(boundary) else 0.0)
         # Network latency makes a 300-420 ms source age normal on the measured
-        # 4K path.  Decay from 120 ms onward, then enforce the hard horizon
-        # above: old masks need progressively stronger image evidence, without
-        # being rejected merely because inference itself was asynchronous.
-        age_penalty = math.exp(-max(0.0, age_ms - 120.0) / 420.0)
+        # 4K path.  Decay from the measured delivery latency onward, then
+        # enforce the hard horizon above: old masks need progressively stronger
+        # image evidence, without being rejected — or silently demoted out of
+        # the full reconstruction — merely because inference itself was
+        # asynchronous on this content.
+        grace_ms = self._age_grace_ms()
+        self._last_grace_ms = grace_ms
+        age_penalty = math.exp(
+            -max(0.0, age_ms - grace_ms) / self.AGE_DECAY_MS)
         confidence = (coverage * age_penalty *
                       math.exp(-3.6 * photo_edge - 1.8 * photo_global -
                                0.42 * fb_edge))
         confidence = max(0.0, min(1.0, confidence))
+        # Published decomposition.  The promotion threshold gates the PRODUCT,
+        # so a score of 0.60 says nothing about which of four independent
+        # factors spent the budget -- and the one that matters is the one worth
+        # improving.  Lowering the threshold instead would be the p95 mistake
+        # again: moving a bar because a number is inconvenient, without
+        # knowing what the number measures.
+        self._last_terms = {
+            "coverage": coverage,
+            "age": age_penalty,
+            "photo_edge": photo_edge,
+            "photo_global": photo_global,
+            "fb_edge": fb_edge,
+            "evidence": math.exp(-3.6 * photo_edge - 1.8 * photo_global -
+                                 0.42 * fb_edge),
+        }
 
         if confidence < self._min_confidence:
+            if coverage <= 0.0:
+                self._reject_causes["empty_boundary"] += 1
+                self._note_epoch_outcome(True)
+                if len(self._empty_fg_fraction) < 400:
+                    self._empty_fg_fraction.append(float(foreground.mean()))
+            else:
+                self._reject_causes["weak_evidence"] += 1
+                self._note_epoch_outcome(False)
             out = None
         else:
             # A scalar score can accept a globally sound registration while
@@ -601,10 +805,26 @@ class MatteAdvector:
                     matte.alpha, backward, contour_band, local))
             self._last_local_reject_pct = reject_pct
             self._last_sparse_pct = sparse_pct
+            # The promotion decision is made HERE, where the evidence and the
+            # age policy both live, and travels as a boolean.  Two independent
+            # conditions rather than one product: the evidence must be strong,
+            # AND the matte must not be expiring.  Folding the age into the
+            # score alone made the second condition an arithmetic consequence
+            # of the first, which is what put it on a float boundary.
+            allow_contour = bool(
+                confidence >= self.CONTOUR_MIN_CONFIDENCE and
+                age_ms < self._contour_age_limit_ms(grace_ms))
+            self._last_allow_contour = allow_contour
+            if allow_contour:
+                self._contour_frames += 1
+            else:
+                self._guard_frames += 1
+            self._note_epoch_outcome(False)
             out = replace(
                 matte, alpha=alpha, pts_ms=float(current_pts),
                 transport_revision=int(round(current_pts * 1000.0)),
                 tracking_confidence=confidence,
+                allow_contour=allow_contour,
                 transport_kind="luma-contour-sparse",
                 reliability=reliability)
         self._cache_key = key
@@ -627,6 +847,13 @@ class MatteAdvector:
             return matte
         try:
             self._last_age_ms = float(video_time_ms) - float(matte.pts_ms)
+            if matte.generation != self._epoch_generation:
+                self._epoch_generation = matte.generation
+                self._epoch_started_ms = float(video_time_ms)
+            self._epoch_since_ms = (
+                float(video_time_ms) - self._epoch_started_ms
+                if self._epoch_started_ms is not None else -1.0)
+            self._note_arrival(matte, video_time_ms)
             self._last_error = ""
             if self._dense_enabled:
                 started = time.perf_counter()
@@ -640,15 +867,18 @@ class MatteAdvector:
                         self._last_local_reject_pct = 100.0
                         self._last_sparse_pct = 0.0
                         self._last_error = "unreliable contour registration"
+                        self._last_allow_contour = False
                         self._rejected += 1
                     elif dense is matte:
                         self._last_kind = "fresh"
                         self._last_confidence = 1.0
                         self._last_local_reject_pct = 0.0
                         self._last_sparse_pct = 0.0
+                        self._last_allow_contour = dense.allow_contour
                     else:
                         self._last_kind = dense.transport_kind
                         self._last_confidence = dense.tracking_confidence
+                        self._last_allow_contour = dense.allow_contour
                     return dense
             p = float(video_time_ms)
             steps = [s for s in self._steps
@@ -659,12 +889,15 @@ class MatteAdvector:
                     self._last_confidence = 1.0
                     self._last_local_reject_pct = 0.0
                     self._last_sparse_pct = 0.0
+                    self._last_allow_contour = matte.allow_contour
                     return matte
                 self._last_kind = "rejected"
                 self._last_confidence = 0.0
                 self._last_local_reject_pct = 100.0
                 self._last_sparse_pct = 0.0
                 self._last_error = "no current-frame transport evidence"
+                self._reject_causes["no_mv_evidence"] += 1
+                self._last_allow_contour = False
                 self._rejected += 1
                 return None
             key = (matte.sequence, matte.generation,
@@ -696,6 +929,10 @@ class MatteAdvector:
                     matte, alpha=adv, pts_ms=projected_pts,
                     transport_revision=int(round(projected_pts * 1000.0)),
                     tracking_confidence=0.50,
+                    # Codec MVs are not dense optical flow and carry no
+                    # current-frame photometric proof: useful for ownership,
+                    # never authoritative enough to rewrite a contour.
+                    allow_contour=False,
                     transport_kind="codec-mv-fallback")
             self._cache_key = key
             self._cache = out
@@ -703,6 +940,8 @@ class MatteAdvector:
                                if out is not None else 'rejected')
             self._last_confidence = float(
                 getattr(out, 'tracking_confidence', 0.0))
+            self._last_allow_contour = bool(
+                getattr(out, 'allow_contour', False))
             self._last_sparse_pct = 0.0
             return out
         except Exception as exc:
@@ -711,6 +950,8 @@ class MatteAdvector:
             self._last_local_reject_pct = 100.0
             self._last_sparse_pct = 0.0
             self._last_error = f"transport exception: {exc}"
+            self._reject_causes["exception"] += 1
+            self._last_allow_contour = False
             self._rejected += 1
             return None
 
@@ -839,9 +1080,10 @@ class MatAnyone2Service:
             "--checkpoint", str(self.runtime.checkpoint),
             "--seed-checkpoint", str(self.runtime.seed_checkpoint),
             # Épinglé : le worker reçoit exactement la consigne. Procédural :
-            # le plafond mesuré (640 par défaut) s'applique à l'hôte ET au
-            # modèle. Une source plus petite reste traitée à sa définition ;
-            # l'env SHORT_SIDE permet toujours le plein format expérimental.
+            # le plafond mesuré (512 par défaut, cf. AUTO_CAP ci-dessus)
+            # s'applique à l'hôte ET au modèle. Une source plus petite reste
+            # traitée à sa définition ; l'env SHORT_SIDE permet toujours le
+            # plein format expérimental.
             "--short-side", str(self.short_side if self._short_side_pinned
                                 else self.auto_cap),
             "--warmup", str(self.warmup),

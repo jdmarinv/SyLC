@@ -32,6 +32,29 @@ def configure_media_loading_support(
 
 
 class MediaLoadingMixin:
+    @staticmethod
+    def _media_display_name(path):
+        """Return a human title for files, ISOs, BDMV folders and drives."""
+        text = str(path or '').strip()
+        if not text:
+            return ''
+        normalized = os.path.normpath(text)
+        leaf = os.path.basename(normalized)
+        if leaf.lower() == 'bdmv':
+            leaf = os.path.basename(os.path.dirname(normalized))
+        if not leaf:
+            drive = os.path.splitdrive(normalized)[0]
+            leaf = f"Blu-ray Disc ({drive})" if drive else normalized
+        stem, extension = os.path.splitext(leaf)
+        return stem if extension and stem else leaf
+
+    def _set_media_window_title(self, resolved_path=None):
+        title = (getattr(self, '_pending_media_display_title', '') or
+                 self._media_display_name(resolved_path))
+        self.setWindowTitle(
+            f"{title} — SyLC 3D Player" if title
+            else "SyLC 3D Player - Premium Edition")
+
     def _dismount_pending_iso(self):
         """Dismount an ISO we just mounted but couldn't use (best-effort)."""
         try:
@@ -156,6 +179,8 @@ class MediaLoadingMixin:
             return
         self._is_loading_file = True
         session_id = self._begin_media_session(original_request)
+        self._pending_media_display_title = self._media_display_name(
+            original_request)
         # Reset multi-segment (seamless-branching) feature state for every load; set below
         # only when a disc feature spans several SSIF segments (an edl:// URI, no temp file).
         self._pending_feature_segments = None
@@ -382,7 +407,7 @@ class MediaLoadingMixin:
         if self.player:
             try:
                 self.player.stop()
-            except:
+            except Exception:
                 pass
 
         # Stop decoder and wait for cleanup to complete
@@ -418,6 +443,7 @@ class MediaLoadingMixin:
         if not self._session_is_current(session_id):
             return
         self.current_file_path = file_path
+        self._set_media_window_title(file_path)
         # Per-FILE memory: recall this title's remembered tuning right at the
         # canonical per-file reset point, so every reset below can prefer the
         # viewer's own choice over the blanket default.
@@ -740,7 +766,7 @@ class MediaLoadingMixin:
                     if hasattr(self, 'player') and self.player:
                         try:
                             mpv_duration = self.player.duration
-                        except:
+                        except Exception:
                             pass # Property access failed
 
                     if mpv_duration and mpv_duration > 0 and self.current_file_path:
@@ -780,7 +806,7 @@ class MediaLoadingMixin:
                                         self.player.command_async('set', 'time-pos', '0')
                                         self.player.command_async('set', 'pause', 'no')
                                         self._arm_hevc_audio_start(0.0)
-                                except:
+                                except Exception:
                                     pass
 
                         self._media_single_shot(50, _safe_start, owner)
@@ -833,7 +859,7 @@ class MediaLoadingMixin:
                                     self.player.command_async('set', 'time-pos', '0')
                                     self.player.command_async('set', 'pause', 'no')
                                     self._arm_hevc_audio_start(0.0)
-                                except:
+                                except Exception:
                                     pass
 
                         self._media_single_shot(50, _safe_fallback_start, owner)
@@ -853,10 +879,10 @@ class MediaLoadingMixin:
                                     self.player.command_async('set', 'time-pos', '0')
                                     self.player.command_async('set', 'pause', 'no')
                                     self._arm_hevc_audio_start(0.0)
-                                except:
+                                except Exception:
                                     pass
                         self._media_single_shot(50, _safe_last_resort, owner)
-                    except:
+                    except Exception:
                         pass
 
             self._media_single_shot(

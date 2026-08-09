@@ -166,7 +166,20 @@ void DepthStabilizer::reproject(const float* flow_x, const float* flow_y,
                     history_weight_tmp_[si] =
                         sample_slot(history_weights_) * trust;
                 }
-                stability_tmp_[i] = sample_indices(stability_.data()) * trust;
+                // `stability_` describes the age/strength of the surface
+                // evidence, just like ema_ describes its geometry.  A low
+                // flow confidence means "prefer the state already at this
+                // destination", not "erase the state".  The history weights
+                // above deliberately lose trust because an individual old
+                // sample may no longer correspond to this pixel; the scalar
+                // stability field itself must follow the same local/warped
+                // blend as ema_ or every non-perfect flow compounds it toward
+                // zero once per map.
+                const float transported_stability =
+                    sample_indices(stability_.data());
+                stability_tmp_[i] =
+                    stability_[i] * (1.0f - trust) +
+                    transported_stability * trust;
             }
         }
         });
@@ -210,8 +223,11 @@ void DepthStabilizer::reproject(const float* flow_x, const float* flow_y,
                     history_weight_tmp_[si] =
                         sample_slot(history_weights_) * trust;
                 }
-                stability_tmp_[i] = sample(
-                    stability_.data(), source_x, source_y) * trust;
+                const float transported_stability = sample(
+                    stability_.data(), source_x, source_y);
+                stability_tmp_[i] =
+                    stability_[i] * (1.0f - trust) +
+                    transported_stability * trust;
             }
         }
         });
@@ -254,31 +270,26 @@ void DepthStabilizer::fit_scale_shift(const float* ref, const float* cur, size_t
 bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
                            const float* motion, float scene_change,
                            const float* confidence,
-                           const float* surface_boundary) {
+                           const float* surface_boundary,
+                           const float* fine_structure) {
     const size_t n = ema_.size();
     bool cut = false;
     // Video-time scale of this source observation relative to the calibration
     // cadence. video_ts == 1 takes the exact historical arithmetic (no pow,
     // bitwise back-compat); other cadences convert every per-observation rate r
     // into 1-(1-r)^video_ts so half-lives stay video-time true. Per-pixel rates
-    // (alpha after its modifiers, the motion-driven stability decay) go
-    // through small LUTs -- two transcendentals per LUT entry per step
-    // instead of two per pixel.
+    // (alpha after its modifiers) goes through a small LUT -- two
+    // transcendentals per LUT entry per step instead of one per pixel.
     // All state evolution belongs to VIDEO time. update_dt_ms_ measures how
     // long the provider/worker took and is deliberately absent from the math.
     const float video_ts = source_dt_ms_ / kReferenceDtMs;
     const bool unit_time = std::fabs(video_ts - 1.0f) < 1e-6f;
     constexpr int kAlphaLut = 128;
-    constexpr int kDecayLut = 64;
     float alpha_lut[kAlphaLut + 1] = {};
-    float decay_lut[kDecayLut + 1] = {};
     if (!unit_time) {
         for (int k = 0; k <= kAlphaLut; ++k)
             alpha_lut[k] = 1.0f - std::pow(
                 1.0f - static_cast<float>(k) / kAlphaLut, video_ts);
-        for (int k = 0; k <= kDecayLut; ++k)
-            decay_lut[k] = std::pow(
-                1.0f - 0.78f * static_cast<float>(k) / kDecayLut, video_ts);
     }
     auto norm_alpha = [&](float al) {
         if (unit_time) return al;
@@ -287,13 +298,6 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
         const int k = std::min(kAlphaLut - 1, static_cast<int>(p));
         const float f = p - static_cast<float>(k);
         return alpha_lut[k] + (alpha_lut[k + 1] - alpha_lut[k]) * f;
-    };
-    auto motion_decay = [&](float motion_t) {
-        if (unit_time) return 1.0f - 0.78f * motion_t;
-        const float p = motion_t * kDecayLut;
-        const int k = std::min(kDecayLut - 1, static_cast<int>(p));
-        const float f = p - static_cast<float>(k);
-        return decay_lut[k] + (decay_lut[k + 1] - decay_lut[k]) * f;
     };
     const float rise_eff =
         unit_time ? 0.18f
@@ -572,20 +576,39 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
                     ? std::max(0.0f, std::min(1.0f, confidence[i])) : 1.0f;
                 const float boundary = surface_boundary
                     ? std::max(0.0f, std::min(1.0f, surface_boundary[i])) : 0.0f;
+                const float fine = fine_structure
+                    ? std::max(0.0f, std::min(1.0f, fine_structure[i])) : 0.0f;
 
-                // Calm evidence builds memory slowly; real local motion or an
-                // articulated boundary destroys it quickly. This decision is
-                // per pixel -- a mostly static shot can therefore keep a long
-                // wall history while a person's neck uses the current frame.
+                // Build persistent evidence in the transported (surface)
+                // coordinate system.  Screen-space luma motion is not, by
+                // itself, instability after reproject(): a correctly tracked
+                // moving face or camera pan is precisely what temporal memory
+                // should follow.  It already speeds the EMA and bypasses the
+                // local deadband below.  Flow uncertainty attenuates the
+                // individual history weights, while an actually moving depth
+                // boundary still collapses stability immediately below.
+                //
+                // The old mutually-exclusive branch only allowed this rise
+                // when motion_t was exactly zero.  Production `motion` also
+                // contains the flow-uncertainty penalty, so ordinary film
+                // pixels were decayed both here and in reproject(), driving a
+                // confident 0.75 surface to ~0.002 and permanently disabling
+                // the history/deadband paths.
                 const float stable_target = 0.25f + 0.75f * conf;
-                if (motion_t > 0.0f) {
-                    stability_[i] *= motion_decay(motion_t);
-                } else {
-                    stability_[i] +=
-                        rise_eff * (stable_target - stability_[i]);
-                }
+                stability_[i] +=
+                    rise_eff * (stable_target - stability_[i]);
+                // The guard-band motion also contains the flow-uncertainty
+                // penalty. A one-texel wire over moving fog therefore inherits
+                // the fog's motion even when the wire is fixed. Discount that
+                // moderate contamination when the image proves a two-sided
+                // ridge; the residual still admits genuinely strong motion.
+                const float fine_discount = std::max(
+                    0.0f, std::min(1.0f, fine_structure_motion_discount));
+                const float boundary_motion =
+                    mv * (1.0f - fine_discount * fine);
                 const bool moving_boundary =
-                    boundary >= 0.35f && mv >= boundary_fast_motion;
+                    boundary >= 0.35f &&
+                    boundary_motion >= boundary_fast_motion;
                 if (moving_boundary)
                     stability_[i] *= boundary_collapse;
                 stability_[i] =
@@ -849,10 +872,13 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
     const float target_hi = sel_vals[1];
 
     if (!tone_primed_ || cut) {
-        tone_lo_ = target_lo;
-        tone_hi_ = target_hi;
+        const float prime_span = std::max(0.0f, target_hi - target_lo);
+        const float prime_margin = std::max(
+            0.0f, std::min(1.0f, tone_prime_margin));
+        tone_lo_ = target_lo - prime_margin * prime_span;
+        tone_hi_ = target_hi + prime_margin * prime_span;
         tone_primed_ = true;
-    } else {
+    } else if (!tone_lock) {
         // Expand promptly to avoid clipping newly entering geometry; contract
         // slowly so a subject entering/leaving cannot make the whole scene
         // "breathe". Limit each update relative to the established range.
@@ -860,10 +886,13 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
         // Per-unit-time cap: the same VIDEO second may move the range
         // by the same amount whether it arrives as 8 maps or 19.
         const float max_step =
-            established * 0.04f * std::min(video_ts, 4.0f);
+            established * std::max(0.0f, tone_max_step_frac) *
+            std::min(video_ts, 4.0f);
+        const float expand_rate = std::max(
+            0.0f, std::min(1.0f, tone_expand_rate));
         const float expand_eff =
-            unit_time ? 0.20f
-                      : 1.0f - std::pow(0.80f, video_ts);
+            unit_time ? expand_rate
+                      : 1.0f - std::pow(1.0f - expand_rate, video_ts);
         const float tone_eff =
             unit_time ? tone_alpha
                       : 1.0f - std::pow(1.0f - tone_alpha, video_ts);

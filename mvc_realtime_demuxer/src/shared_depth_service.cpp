@@ -4,6 +4,7 @@
 
 #include "depth_engine.h"
 #include "depth_stabilizer.h"
+#include "synth3d_temporal_filter.h"
 #include "cut_gate.h"
 #include "parallel_chunks.h"
 
@@ -57,6 +58,22 @@ public:
         if (reaper_.joinable()) reaper_.join();
     }
 
+    // The registry creates, warms, retires and trims services and says
+    // nothing about any of it.  A freeze observed in normal playback showed a
+    // healthy service at 1552 submissions being replaced by a brand-new one
+    // stuck at 5 -- with no log line between the two, three different causes
+    // fit the evidence equally well and none could be ruled out.  These four
+    // lines are on TRANSITIONS only (create / reuse / retire / trim), never
+    // per frame, so they cost nothing and turn one reproduction into an
+    // answer instead of a shortlist.
+    static std::string narrow_key(const std::wstring& key) {
+        std::string out;
+        out.reserve(key.size());
+        for (wchar_t c : key)
+            out.push_back(c < 128 ? static_cast<char>(c) : '?');
+        return out;
+    }
+
     std::shared_ptr<SharedDepthService> acquire_attached(
             const std::wstring& key, uint64_t client_id,
             const Factory& factory) {
@@ -69,6 +86,10 @@ public:
                 it->second.service->client_count() == 0) {
                 // Never return a poisoned idle key. The old worker/session is
                 // released asynchronously while this call installs a clean one.
+                std::fprintf(stderr,
+                    "[DEPTH-REGISTRY] retire poisoned key=%s clients=0 "
+                    "entries=%zu\n",
+                    narrow_key(key).c_str(), entries_.size());
                 retired_.push_back(std::move(it->second.service));
                 entries_.erase(it);
                 notify_reaper = true;
@@ -77,7 +98,17 @@ public:
             if (it != entries_.end()) {
                 it->second.touch = ++touch_;
                 service = it->second.service;
+                std::fprintf(stderr,
+                    "[DEPTH-REGISTRY] reuse key=%s client=%llu clients_before=%d\n",
+                    narrow_key(key).c_str(),
+                    static_cast<unsigned long long>(client_id),
+                    service->client_count());
             } else {
+                std::fprintf(stderr,
+                    "[DEPTH-REGISTRY] CREATE key=%s client=%llu entries=%zu\n",
+                    narrow_key(key).c_str(),
+                    static_cast<unsigned long long>(client_id),
+                    entries_.size());
                 service = factory();
                 entries_.emplace(key, Entry{service, ++touch_});
             }
@@ -150,6 +181,10 @@ private:
                 &entry == warmest && healthy_idle_kept < kMaxWarmIdleServices;
             if (keep_warm) ++healthy_idle_kept;
             if (idle && !keep_warm) {
+                std::fprintf(stderr,
+                    "[DEPTH-REGISTRY] trim idle key=%s failed=%d entries=%zu\n",
+                    narrow_key(it->first).c_str(),
+                    entry.service->failed() ? 1 : 0, entries_.size());
                 retired_.push_back(std::move(entry.service));
                 it = entries_.erase(it);
             } else {
@@ -341,9 +376,34 @@ int flow_threads_from_env() {
 // sequence so a retry can overtake an already-finished later map without
 // dropping it.
 struct InferPipe {
-    explicit InferPipe(DepthEngine& engine) : engine_(engine) {}
+    InferPipe(DepthEngine& engine, std::atomic<int>* phase_out,
+              std::atomic<int64_t>* since_out)
+        : phase_out_(phase_out), since_out_(since_out), engine_(engine) {}
 
     ~InferPipe() { stop(); }
+
+    // Three unbounded cv_.wait live in this class and a freeze in any of them
+    // looks identical from outside: the worker stops, grants/submits stop, and
+    // the status line keeps reporting the LAST live cycle's timings.  Naming
+    // the wait that is currently held turns a shortlist of three into one
+    // answer.  Written before entering each wait, cleared after: a frozen pipe
+    // reports where it is frozen.
+    enum Phase { kIdle = 0, kJobWait, kInfer, kPushWait, kSubmitWait,
+                 kResultWait };
+    static const char* phase_name(int phase) {
+        switch (phase) {
+            case kJobWait:    return "job_wait";
+            case kInfer:      return "infer";
+            case kPushWait:   return "push_wait";
+            case kSubmitWait: return "submit_wait";
+            case kResultWait: return "result_wait";
+            default:          return "idle";
+        }
+    }
+    int phase() const { return phase_.load(std::memory_order_relaxed); }
+    int64_t phase_since_ms() const {
+        return phase_since_ms_.load(std::memory_order_relaxed);
+    }
 
     void start() {
         thread_ = std::thread([this] { run(); });
@@ -361,6 +421,11 @@ struct InferPipe {
     // Copies `input` into the job slot. The slot is free by construction when
     // called in the worker's strict submit/wait alternation; the wait below is
     // a safety net, not a hot path.
+    // submit()/wait_result() run on the WORKER thread, so the phase they used
+    // to stamp here raced the pipe thread's own on the same pair of atomics --
+    // a reader could pick up one thread's phase with the other's timestamp.
+    // The worker now names these two regions itself (wphase submit/result), so
+    // `ipipe=` describes the inference thread and nothing else.
     void submit(const std::vector<float>& input, uint64_t seq) {
         std::unique_lock<std::mutex> lk(mtx_);
         cv_.wait(lk, [&] { return stop_ || !job_fresh_; });
@@ -404,6 +469,7 @@ private:
             uint64_t seq = 0;
             {
                 std::unique_lock<std::mutex> lk(mtx_);
+                mark_phase(kJobWait);
                 cv_.wait(lk, [&] { return stop_ || job_fresh_; });
                 if (stop_) return;
                 input.swap(job_input_);
@@ -416,6 +482,7 @@ private:
             result.raw.resize(out_n_);
             result.confidence.assign(out_n_, 1.0f);
             const auto t0 = Clock::now();
+            mark_phase(kInfer);
             result.failed = !engine_.infer(
                 input.data(), result.raw.data(), result.error,
                 result.confidence.data());
@@ -423,14 +490,30 @@ private:
                 Clock::now() - t0).count();
             {
                 std::unique_lock<std::mutex> lk(mtx_);
+                mark_phase(kPushWait);
                 cv_.wait(lk, [&] { return stop_ || results_.size() < 2; });
                 if (stop_) return;
                 results_.push_back(std::move(result));
+                mark_phase(kIdle);
             }
             cv_.notify_all();
         }
     }
 
+    void mark_phase(int phase) {
+        const int64_t now =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now().time_since_epoch()).count();
+        phase_.store(phase, std::memory_order_relaxed);
+        phase_since_ms_.store(now, std::memory_order_relaxed);
+        if (phase_out_) phase_out_->store(phase, std::memory_order_relaxed);
+        if (since_out_) since_out_->store(now, std::memory_order_relaxed);
+    }
+
+    std::atomic<int> phase_{kIdle};
+    std::atomic<int64_t> phase_since_ms_{0};
+    std::atomic<int>* phase_out_ = nullptr;
+    std::atomic<int64_t>* since_out_ = nullptr;
     DepthEngine& engine_;
     std::thread thread_;
     std::mutex mtx_;
@@ -1017,10 +1100,12 @@ void compute_boundary(const std::vector<float>& depth,
                       int width, int height,
                       std::vector<float>& boundary,
                       std::vector<float>& scratch,
-                      int max_threads) {
+                      int max_threads,
+                      std::vector<float>* fine_structure) {
     const size_t n = static_cast<size_t>(width) * height;
     boundary.assign(n, 0.0f);
     scratch.assign(n, 0.0f);
+    if (fine_structure) fine_structure->assign(n, 0.0f);
     double mean = 0.0, m2 = 0.0, count = 0.0;
     for (float value : depth) {
         count += 1.0;
@@ -1050,6 +1135,26 @@ void compute_boundary(const std::vector<float>& depth,
                 (depth_gradient / depth_scale - 0.18f) / 0.82f);
             const float image_support = clamp01(
                 (luma_gradient - 0.018f) / 0.12f);
+            if (fine_structure) {
+                // Same discriminator as the full-resolution warp: a valid
+                // filament is a luma ridge, brighter or darker than BOTH
+                // sides on at least one axis. Diagonals matter at grid scale,
+                // where a spoke is commonly only one texel wide.
+                auto ridge_axis = [&](size_t ia, size_t ib) {
+                    const float da = luma[i] - luma[ia];
+                    const float db = luma[i] - luma[ib];
+                    return da * db > 0.0f
+                        ? std::min(std::abs(da), std::abs(db)) : 0.0f;
+                };
+                const float ridge = std::max(
+                    std::max(ridge_axis(i - 1, i + 1),
+                             ridge_axis(i - width, i + width)),
+                    std::max(ridge_axis(i - width - 1, i + width + 1),
+                             ridge_axis(i - width + 1, i + width - 1)));
+                float fine = clamp01((ridge - 0.020f) / 0.105f);
+                fine = fine * fine * (3.0f - 2.0f * fine);
+                (*fine_structure)[i] = fine;
+            }
             // A model-only edge remains protected, but an aligned image edge
             // raises confidence that this is a real surface boundary rather
             // than texture/noise inside one object.
@@ -1821,6 +1926,7 @@ void SharedDepthService::attach(uint64_t client_id) {
     last_snap_ms_.store(-1, std::memory_order_release);
     last_snap_video_ms_.store(-1.0, std::memory_order_release);
     suggested_convergence_.store(0.5f, std::memory_order_release);
+    reset_attach_.fetch_add(1, std::memory_order_relaxed);
     reset_stabilizer_.store(true, std::memory_order_release);
     crop_top_.store(0, std::memory_order_release);
     crop_bottom_.store(0, std::memory_order_release);
@@ -1867,8 +1973,19 @@ bool SharedDepthService::wants_input(uint64_t client_id,
                                      double video_time_ms) {
     if (!running() || clients_.load(std::memory_order_acquire) <= 0) return false;
     const auto now = Clock::now();
+    taps_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(input_mtx_);
-    if (input_fresh_) return false;  // worker already owes us this map
+    // This refusal used to move NO counter, which made the two halves of a
+    // freeze indistinguishable in every log: a worker that stops consuming
+    // never clears input_fresh_, so the renderer is locked out here and its
+    // grants/submits/duppts all go silent -- looking exactly like a renderer
+    // that stopped presenting. `taps` vs `busy` separates them: both climbing
+    // means the renderer is calling and the WORKER owes the map; taps flat
+    // means the renderer really did stop.
+    if (input_fresh_) {
+        input_busy_.fetch_add(1, std::memory_order_relaxed);
+        return false;  // worker already owes us this map
+    }
 
     const bool lease_expired =
         leader_id_ == 0 || leader_seen_.time_since_epoch().count() == 0 ||
@@ -2005,7 +2122,12 @@ std::shared_ptr<const SharedDepthService::GeometryFrame> SharedDepthService::sna
     return latest_;
 }
 
-void SharedDepthService::notify_seek() {
+void SharedDepthService::notify_seek(int cause) {
+    switch (cause) {
+        case kResetGeometry: reset_geom_.fetch_add(1, std::memory_order_relaxed); break;
+        case kResetAttach:   reset_attach_.fetch_add(1, std::memory_order_relaxed); break;
+        default:             reset_seek_.fetch_add(1, std::memory_order_relaxed); break;
+    }
     reset_stabilizer_.store(true, std::memory_order_release);
     // A seek may legitimately land on a PTS seen before the jump. The new
     // epoch must be allowed to submit it once.
@@ -2038,28 +2160,129 @@ void SharedDepthService::set_lookahead_advisory(double cut_in_ms,
     lookahead_cut_ms_.store(cut_in_ms, std::memory_order_release);
     lookahead_storm_ms_.store(storm_in_ms, std::memory_order_release);
     lookahead_set_ms_.store(steady_now_ms(), std::memory_order_release);
-    if (cut_pts_ms >= 0.0) note_cut_pts(cut_pts_ms);
+    if (cut_pts_ms >= 0.0) note_cut_pts(cut_pts_ms, true);
 }
 
-void SharedDepthService::note_cut_pts(double pts_ms) {
+void SharedDepthService::sort_cut_boundaries() const {
+    const size_t n = cut_pts_.size();
+    cut_consumed_.resize(n, char(0));
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [this](size_t a, size_t b) { return cut_pts_[a] < cut_pts_[b]; });
+    std::vector<double> pts(n);
+    std::vector<char> consumed(n);
+    for (size_t i = 0; i < n; ++i) {
+        pts[i] = cut_pts_[order[i]];
+        consumed[i] = cut_consumed_[order[i]];
+    }
+    cut_pts_.swap(pts);
+    cut_consumed_.swap(consumed);
+}
+
+void SharedDepthService::note_cut_pts(double pts_ms, bool from_scout) {
     if (!(pts_ms >= 0.0) || !std::isfinite(pts_ms)) return;
     std::lock_guard<std::mutex> lk(cut_pts_mtx_);
     // The same cut arrives from two independent observers (scout ahead of
     // presentation, worker snap behind it) whose media clocks agree only to
     // rounding + one observation: merge anything within half a frame. 21 ms
     // covers 24 fps; at higher rates two REAL cuts are never that close.
-    for (double& c : cut_pts_) {
-        if (std::abs(c - pts_ms) < 21.0) {
+    for (size_t i = 0; i < cut_pts_.size(); ++i) {
+        if (std::abs(cut_pts_[i] - pts_ms) < 21.0) {
             // Keep the EARLIER boundary: the scout dates the cut at the new
             // shot's first frame, the worker snap can only be at/after it.
-            c = std::min(c, pts_ms);
+            const float delta =
+                static_cast<float>(std::abs(cut_pts_[i] - pts_ms));
+            cut_pts_[i] = std::min(cut_pts_[i], pts_ms);
+            cut_merged_.fetch_add(1, std::memory_order_relaxed);
+            if (from_scout) cut_scout_.fetch_add(1, std::memory_order_relaxed);
+            uint32_t observed = merge_peak_bits_.load(std::memory_order_relaxed);
+            float peak;
+            std::memcpy(&peak, &observed, sizeof(peak));
+            while (delta > peak) {
+                uint32_t desired;
+                std::memcpy(&desired, &delta, sizeof(desired));
+                if (merge_peak_bits_.compare_exchange_weak(
+                        observed, desired, std::memory_order_relaxed))
+                    break;
+                std::memcpy(&peak, &observed, sizeof(peak));
+            }
             return;
         }
     }
-    if (cut_pts_.size() >= kMaxCutBoundaries)
+    if (cut_pts_.size() >= kMaxCutBoundaries) {
+        if (!cut_consumed_.empty() && !cut_consumed_.front())
+            cut_expired_.fetch_add(1, std::memory_order_relaxed);
         cut_pts_.erase(cut_pts_.begin());
+        if (!cut_consumed_.empty())
+            cut_consumed_.erase(cut_consumed_.begin());
+    }
+    // A NEW boundary this close to an existing one is the same cut split in
+    // two by observers whose clocks disagree by more than the merge window.
+    for (double c : cut_pts_)
+        if (std::abs(c - pts_ms) < kTwinWindowMs) {
+            cut_twin_.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    // Distance from this NEW boundary to the nearest one already held.  The
+    // pipeline records 47 boundaries/min where the scout publishes 8.6 on the
+    // same content, so most of them are not distinct cuts.  If these distances
+    // pile up just past the 21 ms merge window, the window is simply narrower
+    // than the advisory clock's real precision and widening it removes the
+    // spurious history clears; if they are spread over seconds, they are
+    // genuinely separate events and the cause is upstream.
+    if (!cut_pts_.empty()) {
+        double nearest = 1e12;
+        for (double c : cut_pts_)
+            nearest = std::min(nearest, std::abs(c - pts_ms));
+        const double edges[] = {21.0, 42.0, 84.0, 200.0, 500.0, 2000.0, 1e12};
+        for (size_t i = 0; i < 7; ++i)
+            if (nearest < edges[i]) { ++cut_gap_bins_[i]; break; }
+    }
     cut_pts_.push_back(pts_ms);
-    std::sort(cut_pts_.begin(), cut_pts_.end());
+    // A boundary the WORKER records for its own cut is born consumed: that
+    // cut has already cleared the history at the moment it fired.  Recording
+    // it is still required -- the renderer's plate gate and the disparity
+    // ease-down read the same list and must learn about a cut the scout
+    // missed -- but letting the worker's own crossing test pick it up again
+    // clears the history a SECOND time.  Measured: the worker recorded 16.9
+    // boundaries/min against its own 16.5 depth cuts/min, and total clears
+    // ran at 44.6/min where the real cut rate is 10.8.
+    cut_consumed_.push_back(from_scout ? char(0) : char(1));
+    cut_recorded_.fetch_add(1, std::memory_order_relaxed);
+    if (from_scout) {
+        cut_scout_.fetch_add(1, std::memory_order_relaxed);
+        cut_rec_scout_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        cut_rec_worker_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Already behind the playhead: no future (previous, current) interval can
+    // contain it, so this boundary is born dead and will expire in 4 s.
+    const double consumed = consumed_video_ms_.load(std::memory_order_acquire);
+    if (consumed >= 0.0 && pts_ms <= consumed) {
+        cut_late_.fetch_add(1, std::memory_order_relaxed);
+        // Born dead for the crossing test; carry it to the next observation
+        // rather than letting it age out unused.  SCOUT boundaries only: the
+        // worker records its own cut at the observation it just consumed, so
+        // it is "late" by construction -- carrying that one re-applies a cut
+        // the stabilizer has already acted on, which is the double clear this
+        // whole path exists to avoid.  Nothing to rescue: it never missed.
+        if (from_scout && consumed - pts_ms <= kLateBoundaryGraceMs)
+            boundary_pending_.store(true, std::memory_order_release);
+        const float lateness = static_cast<float>(consumed - pts_ms);
+        uint32_t observed = late_peak_bits_.load(std::memory_order_relaxed);
+        float peak;
+        std::memcpy(&peak, &observed, sizeof(peak));
+        while (lateness > peak) {
+            uint32_t desired;
+            std::memcpy(&desired, &lateness, sizeof(desired));
+            if (late_peak_bits_.compare_exchange_weak(
+                    observed, desired, std::memory_order_relaxed))
+                break;
+            std::memcpy(&peak, &observed, sizeof(peak));
+        }
+    }
+    sort_cut_boundaries();
 }
 
 void SharedDepthService::note_motion_hints(
@@ -2130,6 +2353,7 @@ bool SharedDepthService::fetch_motion_hints(
 bool SharedDepthService::cross_shot(double map_video_ms,
                                     double presented_video_ms) const {
     std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+    cut_consumed_.resize(cut_pts_.size(), char(0));
     bool gated = false;
     for (size_t i = 0; i < cut_pts_.size();) {
         const double c = cut_pts_[i];
@@ -2137,7 +2361,14 @@ bool SharedDepthService::cross_shot(double map_video_ms,
         // playhead can no longer separate any live map from any presented
         // frame (the worker republishes within ~2 frames of real time).
         if (presented_video_ms >= 0.0 && presented_video_ms - c > 4000.0) {
+            // Retiring a boundary the depth path never crossed means a cut
+            // the scout SAW and the geometry never acted on.  That is the
+            // number `cut_bnd` cannot show, because it counts consumptions.
+            if (!cut_consumed_[i])
+                cut_expired_.fetch_add(1, std::memory_order_relaxed);
             cut_pts_.erase(cut_pts_.begin() + static_cast<ptrdiff_t>(i));
+            cut_consumed_.erase(cut_consumed_.begin() +
+                                static_cast<ptrdiff_t>(i));
             continue;
         }
         if (cross_shot_gate(map_video_ms, presented_video_ms, c))
@@ -2205,6 +2436,10 @@ std::string SharedDepthService::status() const {
             if (hint.pts_ms >= 0.0) ++mv_slots;
     }
     char buf[1536] = {};
+    // Materialised before the snprintf that consumes it: cut_gap_histogram()
+    // takes cut_pts_mtx_, so it must not run inside the argument list where
+    // the lock order relative to the other loads would be unspecified.
+    const std::string gap_histogram = cut_gap_histogram();
     std::snprintf(
         buf, sizeof(buf),
         "state=%s provider=%s views=%d side=%d fps=%.1f "
@@ -2222,6 +2457,9 @@ std::string SharedDepthService::status() const {
         "source_ms=%.1f update_ms=%.1f age_ms=%lld clients=%d cuts=%llu "
         "cut_bnd=%llu cut_src=%llu cut_depth=%llu depthres=%.3f "
         "depthbase=%.3f "
+        "bnd_rec=%llu bnd_mrg=%llu bnd_exp=%llu bnd_late=%llu bnd_carry=%llu "
+        "ipipe=%s ipipe_ms=%lld wphase=%s wphase_ms=%lld "
+        "taps=%llu busy=%llu rst=%llu:%llu:%llu mrst=%llu mdrop=%llu bnd_twin=%llu bnd_scout=%llu bnd_rs=%llu bnd_rw=%llu bnd_gap=%s mrg_ms=%.0f late_ms=%.0f scene_max=%.3f "
         "mvslots=%zu "
         "motion=%.3f flow=%.2f alpha=%.3f conf=%.3f stable=%.3f "
         "history=%.2f scene=%.3f crop=%d:%d:%d:%d crop_conf=%.2f "
@@ -2283,6 +2521,45 @@ std::string SharedDepthService::status() const {
             cut_depth_.load(std::memory_order_acquire)),
         static_cast<double>(depth_residual_.load(std::memory_order_acquire)),
         static_cast<double>(depth_baseline_.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            cut_recorded_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_merged_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_expired_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_late_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_carried_.load(std::memory_order_relaxed)),
+        InferPipe::phase_name(ipipe_phase_.load(std::memory_order_relaxed)),
+        static_cast<long long>(ipipe_age_ms()),
+        wphase_name(wphase_.load(std::memory_order_relaxed)),
+        static_cast<long long>(wphase_age_ms()),
+        static_cast<unsigned long long>(taps_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            input_busy_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            reset_seek_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            reset_geom_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            reset_attach_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            map_reset_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            map_dropped_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_twin_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_scout_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_rec_scout_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            cut_rec_worker_.load(std::memory_order_relaxed)),
+        gap_histogram.c_str(),
+        static_cast<double>(merge_peak()),
+        static_cast<double>(late_peak()),
+        static_cast<double>(scene_peak()),
         mv_slots,
         static_cast<double>(motion_.load(std::memory_order_acquire)),
         static_cast<double>(flow_.load(std::memory_order_acquire)),
@@ -2395,11 +2672,17 @@ void SharedDepthService::worker_main() {
     std::vector<float> confidence(n, 1.0f);
     std::vector<float> full_frame_luma;
     std::vector<float> surface_boundary(n, 0.0f);
+    std::vector<float> fine_structure(n, 0.0f);
     std::vector<float> surface_scratch(n, 0.0f);
     std::vector<uint16_t> q16(n, 0);
     std::vector<uint16_t> realign_scratch;
     bool have_previous_image = false;
     DepthStabilizer stabilizer(n);
+    // Post-normalization multiresolution memory. It deliberately runs after
+    // contour realignment below: that is the exact ordering validated by the
+    // captured wheel replay.
+    DepthMultiscaleFilter multiscale_filter(width, height);
+    SafetyTemporalFilter cpu_safety_filter(width, height);
     // Confirms the source-histogram scene-cut signal over two consecutive
     // frames before it may suppress flow/re-prime temporal history or drive
     // step()'s internal scene-cut OR -- collapses single-frame flash/fade
@@ -2459,6 +2742,8 @@ void SharedDepthService::worker_main() {
     bool have_update_time = false;
     const int flow_threads = flow_threads_from_env();
     stabilizer.worker_threads = flow_threads;
+    multiscale_filter.worker_threads = flow_threads;
+    cpu_safety_filter.worker_threads = flow_threads;
     {
         // SYLC_SYNTH3D_DEPTHCUT_ADAPT=0 restores the fixed 0.35 depth-cut
         // threshold (disables the ambient-baseline outlier gate).
@@ -2486,7 +2771,7 @@ void SharedDepthService::worker_main() {
             std::free(env);
         }
     }
-    InferPipe pipe(engine);
+    InferPipe pipe(engine, &ipipe_phase_, &ipipe_since_ms_);
     pipe.out_n_ = n;
     pipe.start();
     uint64_t next_seq = 1;
@@ -2509,7 +2794,9 @@ void SharedDepthService::worker_main() {
                           const std::vector<float>& reprime_input) -> bool {
         InferPipe::Result result;
         const auto reswait_start = Clock::now();
+        mark_worker_phase(4);
         if (!pipe.wait_result(done.seq, result)) return false;   // stopping
+        mark_worker_phase(7);
         // WALL time spent blocked here. result.infer_ms is the engine's own
         // measurement, so a queued/late inference was previously invisible.
         reswait_ms_accum += std::chrono::duration<double, std::milli>(
@@ -2521,11 +2808,15 @@ void SharedDepthService::worker_main() {
         infer_ms_accum += result.infer_ms;
         const auto joinwait_start = Clock::now();
         if (done.flow_task.valid()) {
+            mark_worker_phase(5);
             done.flow_task.get();
+            mark_worker_phase(7);
             flow_ms_accum += done.flow_task_ms;
         }
         if (done.future_task.valid()) {
+            mark_worker_phase(6);
             done.future_task.get();
+            mark_worker_phase(7);
             flow_ms_accum += done.future_task_ms;
         }
         // Same asymmetry as above: flow_task_ms is the task's own duration, so
@@ -2552,7 +2843,7 @@ void SharedDepthService::worker_main() {
         normalize_da3_confidence(raw_confidence, confidence);
         synth3d_surface::compute_boundary(
             raw, luma, width, height, surface_boundary, surface_scratch,
-            flow_threads);
+            flow_threads, &fine_structure);
         synth3d_surface::refine_observation(
             raw, luma, confidence, surface_boundary,
             width, height, surface_scratch, flow_threads);
@@ -2745,14 +3036,22 @@ void SharedDepthService::worker_main() {
         // (shot/reverse-shot faces) — the case where blending would imprint
         // the old shot's contours into the new one for the EMA's half-life.
         float scene_signal = source_cut_step ? histogram_distance : 0.0f;
-        if (done.boundary_cut)
+        // A CutGate confirmation is RETROSPECTIVE: it lands on the frame after
+        // the cut, where the distance is calm by definition -- that calm is
+        // precisely what identified the cut rather than a flash. Passing it
+        // raw makes the stabilizer's own >= scene_cut_threshold test reject
+        // the very cut the gate just confirmed, so the snap never happens and
+        // `cut_src` reads 0 no matter how correct the gate is. Raise it the
+        // same way a crossed boundary is raised; a genuinely high measured
+        // distance still passes through untouched, so `scene=` stays honest.
+        if (source_cut || done.boundary_cut)
             scene_signal = boundary_scene_signal(
                 histogram_distance, stabilizer.scene_cut_threshold);
         bool cut = stabilizer.step(
             raw.data(), q16.data(),
             done.have_prev ? motion.data() : nullptr,
             scene_signal, confidence.data(),
-            surface_boundary.data());
+            surface_boundary.data(), fine_structure.data());
         // Snapshot the cause before the optional temporal-window retry resets
         // the stabilizer. Previously that retry made a real geometry snap
         // disappear from `cuts`, preventing any evidence-based threshold work.
@@ -2784,9 +3083,12 @@ void SharedDepthService::worker_main() {
                     retry_window.begin() +
                         static_cast<size_t>(view) * frame_values);
             const uint64_t retry_seq = next_seq++;
+            mark_worker_phase(12);
             pipe.submit(retry_window, retry_seq);
             InferPipe::Result retry;
+            mark_worker_phase(13);
             if (!pipe.wait_result(retry_seq, retry)) return false;
+            mark_worker_phase(7);
             if (retry.failed) {
                 set_error(retry.error);
                 return false;
@@ -2797,7 +3099,8 @@ void SharedDepthService::worker_main() {
             normalize_da3_confidence(raw_confidence, confidence);
             synth3d_surface::compute_boundary(
                 raw, luma, width, height,
-                surface_boundary, surface_scratch, flow_threads);
+                surface_boundary, surface_scratch, flow_threads,
+                &fine_structure);
             synth3d_surface::refine_observation(
                 raw, luma, confidence, surface_boundary,
                 width, height, surface_scratch, flow_threads);
@@ -2805,7 +3108,7 @@ void SharedDepthService::worker_main() {
             const auto retry_stab_start = Clock::now();
             cut = stabilizer.step(
                 raw.data(), q16.data(), nullptr, 0.0f, confidence.data(),
-                surface_boundary.data());
+                surface_boundary.data(), fine_structure.data());
             stab_ms_accum += std::chrono::duration<double, std::milli>(
                 Clock::now() - retry_stab_start).count();
             step_ms_accum += std::chrono::duration<double, std::milli>(
@@ -2831,6 +3134,14 @@ void SharedDepthService::worker_main() {
             temporal_history = 1;
         }
 
+        // The retry path re-primes DepthStabilizer and consequently returns
+        // cut=false, so retain the original detector causes as well. Every
+        // renderer-local/worker-local temporal post-filter consumes this same
+        // authoritative reset decision.
+        const bool geometry_temporal_reset =
+            cut || detected_depth_cut || detected_scene_cut ||
+            source_cut_step || done.boundary_cut;
+
         // Velocity-normalized in SOURCE time so the status-line motion=
         // reading describes the video, not the provider's compute cadence.
         motion_.store(
@@ -2841,6 +3152,24 @@ void SharedDepthService::worker_main() {
         effective_alpha_.store(stabilizer.last_effective_alpha(),
                                std::memory_order_release);
         scene_change_.store(histogram_distance, std::memory_order_release);
+        // Peak since the last status read: the instantaneous sample above is
+        // taken every ~10 s and lands on a cut frame essentially never, so it
+        // cannot answer whether this signal ever reaches scene_cut_threshold
+        // on this content.  Compare-and-swap on the bit pattern keeps the
+        // whole thing lock-free and off the hot path's critical section.
+        {
+            uint32_t observed = scene_peak_bits_.load(std::memory_order_relaxed);
+            float peak;
+            std::memcpy(&peak, &observed, sizeof(peak));
+            while (histogram_distance > peak) {
+                uint32_t desired;
+                std::memcpy(&desired, &histogram_distance, sizeof(desired));
+                if (scene_peak_bits_.compare_exchange_weak(
+                        observed, desired, std::memory_order_relaxed))
+                    break;
+                std::memcpy(&peak, &observed, sizeof(peak));
+            }
+        }
         confidence_.store(stabilizer.last_confidence(),
                           std::memory_order_release);
         stability_.store(stabilizer.last_stability(),
@@ -2878,34 +3207,37 @@ void SharedDepthService::worker_main() {
             // near-halo a monocular model paints over the background beside
             // a silhouette never reaches the warp (or blocks the plate from
             // learning the true background there). See realign_contours.
-            static const bool realign_on = []() {
-                char* env = nullptr;   // house idiom (MSVC-safe)
-                size_t len = 0;
-                bool on = true;
-                if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_REALIGN") == 0 &&
-                    env) {
-                    on = env[0] != '0';   // SYLC_SYNTH3D_REALIGN=0 = rollback
-                    free(env);
-                }
-                return on;
-            }();
-            if (realign_on) {
-                const auto realign_start = Clock::now();
-                synth3d_surface::realign_contours(
-                    q16, luma, width, height, realign_scratch, flow_threads);
-                realign_ms_accum += std::chrono::duration<double, std::milli>(
-                    Clock::now() - realign_start).count();
-            }
+            const auto realign_start = Clock::now();
+            synth3d_surface::realign_contours(
+                q16, luma, width, height, realign_scratch, flow_threads);
+            realign_ms_accum += std::chrono::duration<double, std::milli>(
+                Clock::now() - realign_start).count();
+            if (geometry_temporal_reset) multiscale_filter.reset();
+            const bool temporal_has_flow =
+                publish_flow_x.size() == n && publish_flow_y.size() == n;
+            multiscale_filter.apply(
+                q16.data(),
+                temporal_has_flow ? publish_flow_x.data() : nullptr,
+                temporal_has_flow ? publish_flow_y.data() : nullptr,
+                temporal_has_flow ? flow_reliability.data() : nullptr,
+                confidence.data(), surface_boundary.data(),
+                done.source_dt_ms);
             const bool gpu_ownership =
                 gpu_ownership_enabled_.load(std::memory_order_acquire);
             auto published = std::make_shared<GeometryFrame>();
             published->gpu_ownership = gpu_ownership;
+            published->temporal_reset = geometry_temporal_reset;
+            published->source_dt_ms = done.source_dt_ms;
             gpu_owner_.store(gpu_ownership, std::memory_order_release);
             const bool has_flow = publish_flow_x.size() == n &&
                                   publish_flow_y.size() == n;
             const auto pack_start = Clock::now();
             double pack_elapsed_ms = 0.0;
             if (gpu_ownership) {
+                // The GPU owns the safety history in this mode. If ownership
+                // ever falls back to CPU, re-prime instead of reviving a stale
+                // worker-side envelope.
+                cpu_safety_filter.reset();
                 // The renderer consumes these filterable UNORM planes without
                 // a GPU->CPU round trip. Keeping transport separate preserves
                 // the existing plate path while ownership/safety is completed
@@ -2955,6 +3287,12 @@ void SharedDepthService::worker_main() {
                     width, height, ownership_geometry,
                     surface_scratch, flow_threads,
                     &owner_local_ms, &owner_prop_ms);
+                if (geometry_temporal_reset) cpu_safety_filter.reset();
+                cpu_safety_filter.apply(
+                    ownership_geometry.data() + 2, 4,
+                    temporal_has_flow ? publish_flow_x.data() : nullptr,
+                    temporal_has_flow ? publish_flow_y.data() : nullptr,
+                    done.source_dt_ms);
                 owner_ms_accum += std::chrono::duration<double, std::milli>(
                     Clock::now() - owner_start).count();
                 owner_local_ms_accum += owner_local_ms;
@@ -3105,6 +3443,7 @@ void SharedDepthService::worker_main() {
         // drain (seek) a pu les laisser vivantes. Jamais d'écriture sous une
         // lecture concurrente.
         const auto recycle_start = Clock::now();
+        mark_worker_phase(9);
         if (cur.flow_task.valid()) cur.flow_task.get();
         if (cur.future_task.valid()) cur.future_task.get();
         joinwait_ms_accum += std::chrono::duration<double, std::milli>(
@@ -3115,6 +3454,7 @@ void SharedDepthService::worker_main() {
         int source_width = 0;
         int source_height = 0;
         const auto inwait_start = Clock::now();
+        mark_worker_phase(1);
         {
             std::unique_lock<std::mutex> lk(input_mtx_);
             input_cv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
@@ -3147,20 +3487,28 @@ void SharedDepthService::worker_main() {
         last_cycle_top = stage1_start;
         have_cycle_top = true;
 
+        mark_worker_phase(2);
         const bool reset = reset_stabilizer_.exchange(false, std::memory_order_acq_rel);
         if (reset) {
+            map_reset_.fetch_add(1, std::memory_order_relaxed);
             // A seek moved the content: the in-flight PRE-seek map must not
             // be published at the new position. Its result is consumed and
             // dropped so the pipe stays in lock-step; its flow tasks are
             // joined so the drained context can be recycled safely.
             if (have_pending) {
+                mark_worker_phase(10);
                 if (prior.flow_task.valid()) prior.flow_task.get();
                 if (prior.future_task.valid()) prior.future_task.get();
                 InferPipe::Result discard;
+                mark_worker_phase(11);
                 if (!pipe.wait_result(prior.seq, discard)) break;
+                mark_worker_phase(2);
+                map_dropped_.fetch_add(1, std::memory_order_relaxed);
                 have_pending = false;
             }
             stabilizer.reset();
+            multiscale_filter.reset();
+            cpu_safety_filter.reset();
             have_previous_image = false;
             have_capture_time = false;
             have_video_time = false;
@@ -3224,16 +3572,47 @@ void SharedDepthService::worker_main() {
         cur.boundary_cut = false;
         if (valid_video_time && have_video_time) {
             std::lock_guard<std::mutex> lk(cut_pts_mtx_);
-            for (double c : cut_pts_) {
-                if (cross_shot_gate(last_video_time_ms, video_time_ms, c)) {
+            cut_consumed_.resize(cut_pts_.size(), char(0));
+            for (size_t i = 0; i < cut_pts_.size(); ++i) {
+                // Already consumed: either crossed on an earlier observation
+                // (the historical "exactly once by construction") or born
+                // consumed because the worker itself produced it.
+                if (cut_consumed_[i])
+                    continue;
+                if (cross_shot_gate(last_video_time_ms, video_time_ms,
+                                    cut_pts_[i])) {
                     cur.boundary_cut = true;
-                    break;
+                    // Mark every crossed boundary, not just the first: the
+                    // break below leaves later ones unmarked and they would
+                    // then be miscounted as lost when they expire.
+                    cut_consumed_[i] = char(1);
                 }
+            }
+            // A boundary that arrived after the worker had already consumed
+            // its frame cannot be crossed; apply it here, once.
+            if (!cur.boundary_cut &&
+                boundary_pending_.exchange(false, std::memory_order_acq_rel)) {
+                cur.boundary_cut = true;
+                cut_carried_.fetch_add(1, std::memory_order_relaxed);
+                // Retire the boundaries this stands for, so they are not
+                // later counted as lost.
+                for (size_t i = 0; i < cut_pts_.size(); ++i)
+                    if (video_time_ms - cut_pts_[i] >= 0.0 &&
+                        video_time_ms - cut_pts_[i] <= kLateBoundaryGraceMs)
+                        cut_consumed_[i] = char(1);
             }
         }
         last_capture_time = capture_time;
         have_capture_time = true;
         last_video_time_ms = valid_video_time ? video_time_ms : -1.0;
+        // Published for note_cut_pts, which runs on the scout's thread: a
+        // boundary recorded at a pts the worker has ALREADY consumed past can
+        // never fall inside a future (previous, current) interval, so it can
+        // never be crossed and is guaranteed to expire.  Measuring that is
+        // what separates "the boundary arrived late" from "the crossing test
+        // is wrong", and only one of those two is worth fixing.
+        consumed_video_ms_.store(last_video_time_ms,
+                                 std::memory_order_release);
         have_video_time = valid_video_time;
         // The stabilizer is clocked at the S-stage on the map actually being
         // stepped; the prep stage only RECORDS this map's clocks. The clamp is
@@ -3527,6 +3906,7 @@ void SharedDepthService::worker_main() {
 
         // GPU starts on THIS map now; the S-stage below finishes the PREVIOUS
         // one while it runs. This ordering IS the round-6b pipeline.
+        mark_worker_phase(3);
         pipe.submit(temporal_input, cur.seq);
 
         have_previous_image = true;

@@ -55,7 +55,7 @@ def _extract_thumbnail_ffmpeg(video_file, time_pos):
         if result.returncode == 0 and os.path.exists(temp_file):
             return temp_file
         return None
-    except:
+    except Exception:
         return None
 
 
@@ -205,7 +205,7 @@ class TimeSlider(QSlider):
             temp_file = future.result()
             if temp_file:
                 self.extraction_done.emit(time_pos, temp_file)
-        except:
+        except Exception:
             pass
 
     @Slot(float, str)
@@ -223,7 +223,7 @@ class TimeSlider(QSlider):
                     self._show_preview_at(self._pending_mouse_x)
             try:
                 os.remove(temp_file)
-            except:
+            except Exception:
                 pass
         except Exception as e:
             print(f"[ERROR] {e}")

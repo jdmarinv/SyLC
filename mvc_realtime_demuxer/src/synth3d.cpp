@@ -46,11 +46,11 @@ struct SynthCB {
     int   temporal_fill;   // c4.x: round 5a background plate on/off
     float plate_ceiling;   // c4.y: nearness ceiling for plate refresh
     float far_snap_on;     // c4.z: v4 sub-texel background reclaim (1=on)
-    float pad4;            // c4.w
+    float guided_snap_on;  // c4.w: primary full-resolution layer snap (A/B)
     float comfort_soft_disp; // c5.x: untouched knee, fraction of image width
     float comfort_hard_disp; // c5.y: asymptotic envelope, image-width fraction
     int   comfort_enabled;   // c5.z
-    float pad5;              // c5.w
+    float robust_grid_on;    // c5.w: max-of-medians nearness repair (A/B)
     int   lookahead_fill;    // c6.x: one-frame future evidence armed
     float lookahead_min_conf;// c6.y: confidence knee
     float lookahead_strength;// c6.z: maximum future-evidence blend
@@ -155,13 +155,16 @@ bool Synth3D::ensure_pipeline(std::string& err) {
             make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_PROPAGATE,
                     "CS_OwnerPropagate", csOwnerPropagate_) &&
             make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_COMPOSE,
-                    "CS_OwnerCompose", csOwnerCompose_);
+                    "CS_OwnerCompose", csOwnerCompose_) &&
+            make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_SAFETY_TEMPORAL,
+                    "CS_OwnerSafetyTemporal", csOwnerSafetyTemporal_);
         if (!compute_ok) {
             // Optional optimization: keep the renderer alive and let the
             // service publish its historical CPU-composed map.
             csOwnerCompose_.Reset(); csOwnerPropagate_.Reset();
             csOwnerLocal_.Reset(); csOwnerDilate_.Reset();
             csOwnerUncertainty_.Reset();
+            csOwnerSafetyTemporal_.Reset();
             err.clear();
         }
     }
@@ -204,6 +207,7 @@ bool Synth3D::ensure_pipeline(std::string& err) {
             csOwnerCompose_.Reset(); csOwnerPropagate_.Reset();
             csOwnerLocal_.Reset(); csOwnerDilate_.Reset();
             csOwnerUncertainty_.Reset();
+            csOwnerSafetyTemporal_.Reset();
             err.clear();
         }
     }
@@ -282,7 +286,8 @@ bool Synth3D::ensure_depth(std::string& err) {
     td.Format           = DXGI_FORMAT_R16G16_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage            = D3D11_USAGE_DEFAULT;
-    const bool compute_available = csOwnerCompose_ && ownerCb_;
+    const bool compute_available =
+        csOwnerCompose_ && csOwnerSafetyTemporal_ && ownerCb_;
     td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
                           (compute_available ? D3D11_BIND_UNORDERED_ACCESS : 0);
     if (FAILED(device_->CreateTexture2D(&td, nullptr, &depthTex_))) {
@@ -341,6 +346,15 @@ bool Synth3D::ensure_depth(std::string& err) {
                                ownerStateTex_[i], ownerStateSrv_[i],
                                ownerStateUav_[i], "state")) return false;
     }
+    for (int i = 0; i < 2; ++i) {
+        if (!make_intermediate(DXGI_FORMAT_R32_FLOAT,
+                               safetyHistoryTex_[i], safetyHistorySrv_[i],
+                               safetyHistoryUav_[i], "safety history")) {
+            return false;
+        }
+    }
+    safety_history_read_ = 0;
+    safety_history_valid_ = false;
     }
 
     // Round 5a: transport (flow x/y + reliability from the published map) and
@@ -502,8 +516,12 @@ bool Synth3D::ensure_warp(uint32_t y_w, uint32_t y_h, uint32_t c_w, uint32_t c_h
     }
     y_w_ = y_w; y_h_ = y_h; c_w_ = c_w; c_h_ = c_h; plane_fmt_ = fmt;
     // A geometry/format change means a new source: re-prime the shared temporal
-    // filter on the next inference, exactly like a seek.
-    if (depth_service_) depth_service_->notify_seek();
+    // filter on the next inference, exactly like a seek. Tagged apart from a
+    // real seek: the service is SHARED, so one window re-creating its warp
+    // targets resets the map for both, which on screen looks exactly like a
+    // freeze rather than like a re-prime.
+    if (depth_service_)
+        depth_service_->notify_seek(SharedDepthService::kResetGeometry);
     return true;
 }
 
@@ -529,7 +547,12 @@ void Synth3D::release_depth_grid() {
         ownerStateUav_[i].Reset();
         ownerStateSrv_[i].Reset();
         ownerStateTex_[i].Reset();
+        safetyHistoryUav_[i].Reset();
+        safetyHistorySrv_[i].Reset();
+        safetyHistoryTex_[i].Reset();
     }
+    safety_history_read_ = 0;
+    safety_history_valid_ = false;
     transportSrv_.Reset(); transportTex_.Reset();
     for (int i = 0; i < 2; ++i) {
         plateSrv_[i].Reset();
@@ -575,6 +598,7 @@ void Synth3D::release_gpu() {
     clear_lookahead();
     readTex_.Reset(); read_w_ = read_h_ = 0; read_fmt_ = DXGI_FORMAT_UNKNOWN;
     ownerCb_.Reset(); cb_.Reset(); raster_.Reset(); sampler_.Reset();
+    csOwnerSafetyTemporal_.Reset();
     csOwnerCompose_.Reset(); csOwnerPropagate_.Reset(); csOwnerLocal_.Reset();
     csOwnerDilate_.Reset(); csOwnerUncertainty_.Reset();
     psProvenance_.Reset();
@@ -717,7 +741,9 @@ bool Synth3D::run_gpu_ownership(
     const size_t n = static_cast<size_t>(grid_width_) * grid_height_;
     if (frame.surface_rgba16.size() != 4 * n ||
         frame.rgb_rgba16.size() != 4 * n || !ownerSurfaceTex_ ||
-        !ownerRgbTex_ || !depthUav_ || !ownerCb_) {
+        !ownerRgbTex_ || !depthUav_ || !ownerCb_ || !transportSrv_ ||
+        !csOwnerSafetyTemporal_ || !safetyHistoryUav_[0] ||
+        !safetyHistoryUav_[1]) {
         err = "synth3d: incomplete GPU ownership publication/resources";
         return false;
     }
@@ -744,10 +770,24 @@ bool Synth3D::run_gpu_ownership(
         return false;
     }
 
-    const uint32_t owner_cb[4] = {
+    struct OwnerConstants {
+        uint32_t width;
+        uint32_t height;
+        float safety_rise;
+        uint32_t safety_reset;
+    };
+    constexpr float kSafetyReferenceDtMs = 1000.0f * 1001.0f / 24000.0f;
+    float source_dt_ms = frame.source_dt_ms;
+    if (!(source_dt_ms > 0.0f) || !std::isfinite(source_dt_ms))
+        source_dt_ms = kSafetyReferenceDtMs;
+    const float safety_scale = (std::max)(
+        0.10f, (std::min)(12.0f, source_dt_ms / kSafetyReferenceDtMs));
+    const OwnerConstants owner_cb = {
         static_cast<uint32_t>(grid_width_),
-        static_cast<uint32_t>(grid_height_), 0u, 0u};
-    ctx->UpdateSubresource(ownerCb_.Get(), 0, nullptr, owner_cb, 0, 0);
+        static_cast<uint32_t>(grid_height_),
+        0.012f * safety_scale,
+        (frame.temporal_reset || !safety_history_valid_) ? 1u : 0u};
+    ctx->UpdateSubresource(ownerCb_.Get(), 0, nullptr, &owner_cb, 0, 0);
     ID3D11Buffer* owner_cb_ptr = ownerCb_.Get();
     ctx->CSSetConstantBuffers(0, 1, &owner_cb_ptr);
     const UINT groups_x = (static_cast<UINT>(grid_width_) + 15u) / 16u;
@@ -799,12 +839,21 @@ bool Synth3D::run_gpu_ownership(
         read_state = write_state;
     }
 
+    // OwnerRgb/OwnerScalar are rebound to transport/previous history. This
+    // pass also performs the former compose operation, avoiding a typed UAV
+    // read from the R16G16_UNORM geometry texture.
+    const int safety_write = 1 - safety_history_read_;
     std::fill(std::begin(srvs), std::end(srvs), nullptr);
     std::fill(std::begin(uavs), std::end(uavs), nullptr);
     srvs[0] = ownerSurfaceSrv_.Get();
+    srvs[1] = transportSrv_.Get();
+    srvs[2] = safetyHistorySrv_[safety_history_read_].Get();
     srvs[3] = ownerStateSrv_[read_state].Get();
+    uavs[0] = safetyHistoryUav_[safety_write].Get();
     uavs[2] = depthUav_.Get();
-    dispatch(csOwnerCompose_.Get(), srvs, uavs);
+    dispatch(csOwnerSafetyTemporal_.Get(), srvs, uavs);
+    safety_history_read_ = safety_write;
+    safety_history_valid_ = true;
     ctx->CSSetShader(nullptr, nullptr, 0);
     ID3D11Buffer* no_cb = nullptr;
     ctx->CSSetConstantBuffers(0, 1, &no_cb);
@@ -989,6 +1038,7 @@ void Synth3D::clear_lookahead() {
 bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
     const uint16_t* geometry = nullptr;
     const std::vector<uint16_t>* gpu_transport = nullptr;
+    bool pending_gpu_ownership = false;
     // Declared at function scope: geometry aliases this map's storage, so the
     // reference must outlive the Map+memcpy loop below. Scoping it to the
     // else-block dropped the last renderer-side reference before the copy;
@@ -1007,6 +1057,7 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
         }
         geometry = test_geometry_.data();
         gpu_ownership_active_ = false;
+        safety_history_valid_ = false;
     } else {
         if (!depth_service_) return true;
         uint64_t sequence = depth_sequence_;
@@ -1019,13 +1070,13 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
         depth_video_ms_ = source_video_ms;
         const size_t n = static_cast<size_t>(grid_width_) * grid_height_;
         if (snapshot->gpu_ownership) {
-            if (!run_gpu_ownership(ctx, *snapshot, err)) return false;
             if (snapshot->transport_rgba16.size() != 4 * n) {
                 err = "synth3d: GPU ownership transport size mismatch";
                 return false;
             }
             gpu_transport = &snapshot->transport_rgba16;
             geometry = nullptr;
+            pending_gpu_ownership = true;
         } else {
             if (snapshot->geometry.size() !=
                 SharedDepthService::kGeometryChannels * n) {
@@ -1034,6 +1085,7 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
             }
             geometry = snapshot->geometry.data();
             gpu_ownership_active_ = false;
+            safety_history_valid_ = false;
         }
         depth_sequence_ = sequence;
     }
@@ -1086,6 +1138,13 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
             }
         }
         ctx->Unmap(transportTex_.Get(), 0);
+    }
+    // The temporal safety shader consumes the transport belonging to this
+    // exact ownership map, so it must run only after the dynamic transport
+    // texture has been updated (the historical order exposed the prior map).
+    if (pending_gpu_ownership &&
+        !run_gpu_ownership(ctx, *snapshot, err)) {
+        return false;
     }
     depth_valid_ = true;
     depth_dirty_ = false;
@@ -1195,25 +1254,15 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
                           plateTex_[0] && plateTex_[1] && psPlateAccum_;
     cb.temporal_fill = plate_on ? 1 : 0;
     cb.plate_ceiling = 0.45f;
-    // v4 sub-texel background reclaim in guided_nearness (see the shader):
-    // the CPU realign fixed the grid scale, this closes the pixel band
-    // inside the edge texel. SYLC_SYNTH3D_FAR_SNAP=0 = rollback.
-    static const bool far_snap_on = []() {
-        char* env = nullptr;   // house idiom (MSVC-safe, cf. SYLC_FLOW_THREADS)
-        size_t len = 0;
-        bool on = true;
-        if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_FAR_SNAP") == 0 && env) {
-            on = env[0] != '0';
-            free(env);
-        }
-        return on;
-    }();
-    cb.far_snap_on = far_snap_on ? 1.0f : 0.0f;
+    // The three spatial ownership repairs are part of the validated path.
+    cb.far_snap_on = 1.0f;
+    cb.guided_snap_on = 1.0f;
     cb.comfort_soft_disp = params_.comfort_soft_pct * 0.01f;
     cb.comfort_hard_disp = params_.comfort_hard_pct * 0.01f;
     cb.comfort_enabled = (params_.comfort_enabled &&
                           cb.comfort_soft_disp >= 0.0f &&
                           cb.comfort_hard_disp > cb.comfort_soft_disp) ? 1 : 0;
+    cb.robust_grid_on = 1.0f;
     // A future upload is single-use and PTS-addressed.  Merely having four
     // textures allocated is never enough: the held frame must be the exact
     // frame being presented, the source geometry/format must match, and no
@@ -1781,33 +1830,63 @@ bool Synth3D::read_plane(ID3D11DeviceContext* ctx, int slot, std::vector<uint8_t
                          uint32_t& w, uint32_t& h, uint32_t& bpp, std::string& err) {
     out.clear(); w = 0; h = 0; bpp = 0;
     if (!ctx || !device_) { err = "read_plane: synth3d not started"; return false; }
-    if (slot < 0 || slot >= kNumOut || !warpTex_[slot]) { err = "read_plane: bad slot"; return false; }
-    const bool isLuma = (slot == 0 || slot == 3);
-    const uint32_t pw = isLuma ? y_w_ : c_w_;
-    const uint32_t ph = isLuma ? y_h_ : c_h_;
-    const uint32_t pb = (plane_fmt_ == DXGI_FORMAT_R16_UNORM) ? 2u : 1u;
+    const bool is_provenance = slot == 6 || slot == 7;
+    const bool is_geometry = slot == 8;
+    const bool is_surface = slot == 9;
+    const bool is_transport = slot == 10;
+    ID3D11Texture2D* diagnostic_texture = nullptr;
+    DXGI_FORMAT read_format = plane_fmt_;
+    uint32_t pb = (plane_fmt_ == DXGI_FORMAT_R16_UNORM) ? 2u : 1u;
+    if (is_provenance) {
+        diagnostic_texture = provenanceTex_[slot - 6].Get();
+        read_format = DXGI_FORMAT_R32_UINT;
+        pb = 4u;
+    } else if (is_geometry) {
+        diagnostic_texture = depthTex_.Get();
+        read_format = DXGI_FORMAT_R16G16_UNORM;
+        pb = 4u;
+    } else if (is_surface) {
+        diagnostic_texture = ownerSurfaceTex_.Get();
+        read_format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        pb = 8u;
+    } else if (is_transport) {
+        diagnostic_texture = transportTex_.Get();
+        read_format = DXGI_FORMAT_R16G16B16A16_UNORM;
+        pb = 8u;
+    }
+    if (slot < 0 || slot > 10 ||
+        (slot >= 6 ? !diagnostic_texture : !warpTex_[slot])) {
+        err = "read_plane: bad/unavailable slot"; return false;
+    }
+    const bool is_grid = is_geometry || is_surface || is_transport;
+    const bool isLuma = is_provenance || slot == 0 || slot == 3;
+    const uint32_t pw = is_grid ? static_cast<uint32_t>(grid_width_)
+                                : (isLuma ? y_w_ : c_w_);
+    const uint32_t ph = is_grid ? static_cast<uint32_t>(grid_height_)
+                                : (isLuma ? y_h_ : c_h_);
     if (!pw || !ph) { err = "read_plane: no output produced yet"; return false; }
 
-    if (!readTex_ || read_w_ != pw || read_h_ != ph || read_fmt_ != plane_fmt_) {
+    if (!readTex_ || read_w_ != pw || read_h_ != ph || read_fmt_ != read_format) {
         readTex_.Reset();
         D3D11_TEXTURE2D_DESC td = {};
         td.Width            = pw;
         td.Height           = ph;
         td.MipLevels        = 1;
         td.ArraySize        = 1;
-        td.Format           = plane_fmt_;
+        td.Format           = read_format;
         td.SampleDesc.Count = 1;
         td.Usage            = D3D11_USAGE_STAGING;
         td.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
         if (FAILED(device_->CreateTexture2D(&td, nullptr, &readTex_))) {
             err = "read_plane: CreateTexture2D(staging) failed"; return false;
         }
-        read_w_ = pw; read_h_ = ph; read_fmt_ = plane_fmt_;
+        read_w_ = pw; read_h_ = ph; read_fmt_ = read_format;
     }
 
-    ID3D11Texture2D* final_texture =
-        lab_outputs_valid_ && stereo_lab_
-            ? stereo_lab_->output_texture(slot) : warpTex_[slot].Get();
+    ID3D11Texture2D* final_texture = slot >= 6
+        ? diagnostic_texture
+        : (lab_outputs_valid_ && stereo_lab_
+               ? stereo_lab_->output_texture(slot) : warpTex_[slot].Get());
     if (!final_texture) { err = "read_plane: final output unavailable"; return false; }
     ctx->CopyResource(readTex_.Get(), final_texture);
     D3D11_MAPPED_SUBRESOURCE m = {};
@@ -1912,6 +1991,7 @@ bool Synth3D::start(ID3D11Device* dev, const Synth3DParams& p, std::string& err)
     depth_sequence_ = 0;
     depth_video_ms_ = -1.0;
     depth_valid_ = false;
+    safety_history_valid_ = false;
     depth_dirty_ = test_armed_;
     // An empty path is valid for renderer tests: synth3d_set_test_depth()
     // supplies the map and no ORT service is needed.
@@ -1929,6 +2009,7 @@ void Synth3D::request_stop() {
     depth_sequence_ = 0;
     depth_video_ms_ = -1.0;
     plate_valid_ = false;
+    safety_history_valid_ = false;
     plate_snap_seen_ = -1;
     plate_cut_seen_ms_ = -1.0;
     lab_outputs_valid_ = false;
@@ -1953,6 +2034,7 @@ void Synth3D::notify_seek() {
     // post-seek observation. Purge renderer-local temporal RGB immediately;
     // a seek is a shot discontinuity even before that asynchronous roundtrip.
     plate_valid_ = false;
+    safety_history_valid_ = false;
     plate_cut_seen_ms_ = -1.0;
     lab_outputs_valid_ = false;
     clear_lookahead();

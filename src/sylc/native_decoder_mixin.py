@@ -105,7 +105,7 @@ class NativeDecoderMixin:
                 self.player['lavfi-complex'] = ''
                 self.player['video'] = 'auto'
                 self.video_stack.setCurrentWidget(self.video_widget)
-            except:
+            except Exception:
                 pass
                 
             # Restore 2D navigation bar UI - AFTER stack switch and OS compositor updates
@@ -644,7 +644,7 @@ class NativeDecoderMixin:
             except Exception:
                 pass
             self.show_3d_notification("3D MVC mode (mpv fallback)", success=True)
-        except:
+        except Exception:
             pass
 
     def _disable_mpv_video_output(self):
@@ -1899,7 +1899,7 @@ class NativeDecoderMixin:
                 if hasattr(self.mvc_decoder_thread, 'subtitleTracksDetected'):
                     try:
                         self.mvc_decoder_thread.subtitleTracksDetected.disconnect()
-                    except:
+                    except Exception:
                         pass
                 if (hasattr(self.mvc_decoder_thread, 'pgsDataReady') and
                         getattr(self, '_pgs_streaming_connected', False)):
@@ -1998,7 +1998,7 @@ class NativeDecoderMixin:
         if self.demuxer and not getattr(self, '_mvc_shutdown_blocked', False):
             try:
                 self.demuxer.close()
-            except:
+            except Exception:
                 pass
             self.demuxer = None
 
@@ -2006,7 +2006,7 @@ class NativeDecoderMixin:
         if hasattr(self, '_seek_queue') and self._seek_queue:
              try:
                  self._seek_queue._force_reset_state()
-             except:
+             except Exception:
                  pass
 
         # Clear MVC mode flag and references

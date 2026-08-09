@@ -9,7 +9,7 @@
 
 *Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-5.3.0-1f6feb?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-5.3.1-1f6feb?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
@@ -100,19 +100,32 @@ kept separate on purpose, so a faster or slower GPU changes how *often* the
 depth refreshes, never how the depth *behaves*.
 
 Cuts get special treatment, because a depth map is always a frame or two behind
-the picture it describes. A **look-ahead scout** runs a miniature analysis of
-each decoded frame far enough ahead of presentation to see a cut coming, and
-the renderer flattens disparity through the transition rather than warping the
-first frame of a new shot with the previous shot's geometry. The temporal
-history, the accumulated background plate and the depth EMA all re-prime on the
-confirmed cut.
+the picture it describes. **Three independent observers** report a shot
+boundary: a **look-ahead scout** that runs a miniature analysis of each decoded
+frame far enough ahead of presentation to see the cut coming, the source
+histogram, and the depth residual itself. The renderer flattens disparity
+through the transition rather than warping the first frame of a new shot with
+the previous shot's geometry, and the temporal history, the accumulated
+background plate and the depth EMA all re-prime on the confirmed cut.
+
+Detecting a cut is not the same as detecting a *change*, which is where this
+gets subtle. A flash and a hard cut both spike the same distance measure — so a
+detector armed on a bare threshold can only stay safe against flashes by keeping
+its bar high, and a genuine low-contrast cut below that bar is simply invisible.
+The scout therefore judges by **shape**, not magnitude: it arms on the
+exceedance and confirms on the return to calm, which a flash never does because
+the content after it is the content from before. That distinction is what makes
+the reset at every cut exhaustive rather than merely frequent.
 
 Everything above is instrumented and readable at runtime — the 2D→3D menu
 footer reports the provider, the active preset and grid, the delivered depth
 rate and the age of the current map, and the log carries the full per-stage
-breakdown. That instrumentation is not decoration: the fixes promoted in 5.3.0
-were found by reading it, and two of them turned out to be the opposite of what
-the symptom suggested.
+breakdown, down to which region of the depth worker is executing at any instant
+and where a decoded frame was last seen alive. That instrumentation is not
+decoration: the fixes promoted in 5.3.0 were found by reading it, two of them
+turned out to be the opposite of what the symptom suggested, and the freeze
+described below was solved only after the one counter that could have named it
+was finally written.
 
 ---
 
@@ -128,6 +141,7 @@ Months of work hide inside a few one-line fixes. A taste:
 - **The 4K film that converted faster than the 1080p one.** A 4K HEVC master hit 24 depth maps per second; the *same film* in 1080p H.264 managed 19.5. Same inference grid, same engine — and the 1080p file's GPU inference was measured **2.3× faster** (9 ms vs 21 ms). A component that is faster inside a system that is slower is never a throughput problem; it is a *phase* problem. The depth engine turned out to be idle-waiting 45 % of every cycle: the readback copy it needs was being issued but **not submitted** — a 1080p frame carries so little GPU work that the driver never accumulated enough to flush its command buffer on its own, so the copy was still unreadable a whole frame later, no work was handed to the engine at all, and it lost 41.7 ms. On the 4K path the heavy per-frame work flushed it implicitly, which is precisely why the *harder* file never missed. One `Flush()` after the copy: stalled hand-offs went from 436 in 1991 to **1**, and the cycle locked to 41.7 ms.
 - **The cut that tore one frame, every time.** Every shot change produced a single wavy, "gravitational-lensing" frame. The cut *detection* was never at fault — it is reliable — and every piece of temporal state (flow, plate, EMA, history) was correctly re-primed. The culprit was the **advisory** that carries the news: it was refreshed by a **10 Hz** timer while frames present at **24 fps**, so it stayed frozen for up to 100 ms. On the first frame of a new shot it still read "a cut is coming in +δ ms" — so the renderer re-opened up to 55 % of the disparity budget and kept filling disocclusions from a background plate made entirely of *the previous shot's* pixels. Dead-reckoning the advisory against its own age puts the deadline back where it belongs.
 - **The seek that cost a second of depth.** Every seek deliberately bounced the adaptive selection back through the square inference grid so the new position could re-earn its verdict. Sound in principle — a film really can switch between Scope and IMAX reels — but on a natively wide master the selection comes from the **coded frame dimensions**, and those belong to the file, not to the position: no seek can invalidate them. The detour was protecting nothing, and charging ~1-3 s of flat-then-square-then-flat depth and two full temporal re-primes for it. Now only a selection derived from an encoded matte still takes the safe route.
+- **The picture that stopped while everything stayed healthy.** The image froze, the audio played on, both windows froze together — and every diagnostic in the log looked fine. It cost two evenings, most of them spent dissecting the depth engine, which turned out to be the *victim*. The blind spot was a single refusal that moved no counter: when the depth worker has not yet taken the previous frame, the service declines the next one and returns silently. So a stalled worker (renderer locked out) and a stalled renderer (worker starving) wrote **byte-identical logs** — every hypothesis built on those counters was unfalsifiable. Two counters split them apart in one reproduction, and the answer was somewhere else entirely: HEVC delivery is a **one-token credit**. The decoder marks a single presentation pending, emits, and waits for the GUI to acknowledge before emitting again. One acknowledgement out of 361 never came back. Over the following 26 seconds the decoder produced 582 frames and dropped **576** of them, while decode, audio and the cut scout all ran at full cadence. The healthy round-trip peaks at 276 ms; there is no grey zone between that and 26 seconds. A token held past one second is now reclaimed — a permanent freeze becomes a one-second hiccup — and every reclaim is counted and logged, because a guard that hides the defect it works around is worse than the defect.
 
 This is the kind of work that doesn't show up in a feature list — but it's the difference between "plays MVC" and *plays MVC correctly, every frame, on every disc.*
 
@@ -165,6 +179,14 @@ This is the kind of work that doesn't show up in a feature list — but it's the
   bars and infers on a **rectangular grid** — 756×322 instead of 756×756,
   57 % fewer depth pixels, roughly twice the depth rate for the same picture,
   because black bars carry no depth worth computing.
+  **5.3.1 makes the reset at every cut exhaustive.** Depth from before a shot
+  change could still survive into the frames after it, because a detector armed
+  on a bare threshold cannot tell a hard cut from a flash and had to stay blind
+  to low-contrast cuts to stay safe against flashes. The scout now judges by
+  shape rather than magnitude, boundaries seen twice no longer clear the
+  temporal history twice, and late boundaries are carried instead of expiring
+  unseen. The same release fixes a rare freeze in which the picture stopped
+  while the audio played on (see the war story below).
 - **Frame-packed 3D output** (detached window) + embedded 2D view.
 - **Broad container support** — **MKV / MP4 / AVI / MOV / FLV / WebM / raw `.h264`** (the native C++ demuxer + a libavformat-backed demuxer), all decoded by edge264.
 - **Raw Blu-ray streams** — plays **SSIF** (3D) and **M2TS** (2D) directly, *no remux*, with frame-accurate seeking.
@@ -193,7 +215,7 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 
 | Flavor | Asset | Notes |
 |---|---|---|
-| **Portable folder** | `SyLC_3D_Player_v5.3.0_win-x64.zip` | Unzip anywhere and run `SyLC_3D_Player.exe` — no extraction step, no installer. |
+| **Portable folder** | `SyLC_3D_Player_v5.3.1_win-x64.zip` | Unzip anywhere and run `SyLC_3D_Player.exe` — no extraction step, no installer. |
 
 Everything needed to play video — decoder, demuxer, audio, codecs, Python
 runtime — is bundled.
@@ -210,7 +232,7 @@ The Windows module requires **AVX2**. edge264 contains baseline, x86-64-v2 and
 x86-64-v3 implementations and dispatches to the best supported one at runtime. Its
 SIMD hot loop therefore runs natively on Zen 2/Z2 A and other supported AVX2 CPUs:
 real silicon, no translation layer.
-*(The ARM64/NEON port lives in the codebase, but **5.3.0 ships Windows x64 only**.)*
+*(The ARM64/NEON port lives in the codebase, but **5.3.1 ships Windows x64 only**.)*
 
 ---
 
@@ -231,7 +253,7 @@ Ryzen Z2 A / low-power Zen 2 qualification and tuning:
 ## Get started
 
 1. Download the asset for your platform from **Releases**.
-2. Unzip `SyLC_3D_Player_v5.3.0_win-x64.zip` anywhere and run `SyLC_3D_Player.exe`.
+2. Unzip `SyLC_3D_Player_v5.3.1_win-x64.zip` anywhere and run `SyLC_3D_Player.exe`.
 3. For **2D→3D AI conversion**: open the **2D→3D menu → Depth models…** and pick
    a pack. Start with **Small** (960 MB) — every preset works on it. Skip this
    if you only play 3D content; nothing else needs it.
@@ -258,12 +280,14 @@ cd ..
 scripts\build\build_exe_v530.bat
 ```
 
-`scripts/build/build_exe_v530.bat` is the current release script for v5.3.0: a one-folder
+`scripts/build/build_exe_v530.bat` is the current release script for **v5.3.1** —
+the `v530` in its name is historical, the script stamps `--file-version=5.3.1`
+and is the only script kept in step with the release. It produces a one-folder
 standalone build that bundles `onnxruntime.dll`,
 `DirectML.dll` and `models/MANIFEST.json` — the inference runtime and the
 download manifest, but no model weights.
 
-The older `scripts/build/build_exe_onefile.bat` is **not part of the v5.3.0 release**. It is
+The older `scripts/build/build_exe_onefile.bat` is **not part of the v5.3.1 release**. It is
 still stamped 5.0.0 and bundles none of the three files above, so a binary built
 from it reports `models/MANIFEST.json is missing from this install` and cannot
 do AI conversion at all. That is why the release ships one asset, the portable

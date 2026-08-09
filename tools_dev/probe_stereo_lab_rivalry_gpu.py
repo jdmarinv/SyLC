@@ -202,11 +202,51 @@ def _score(left: np.ndarray, right: np.ndarray, source: np.ndarray,
     }
 
 
+def _score_chroma_touched(raw_field: dict, lab_field: dict) -> dict[str, float]:
+    """Amplitude of what the Lab actually changed, not where it ranks.
+
+    The zone percentiles answer a question they cannot answer: the Lab leaves
+    97-98% of the rivalry zone bit-identical, so a p95 over the whole zone is
+    set by untouched samples.  When ~40 touched samples move to the top of the
+    ranking they displace the entire tail, and the p95 reports that rank shift
+    as if it were a degradation at the p95 level.  Measured: excluding the
+    touched samples makes raw and Lab p95 identical to four decimals on the two
+    topologies that fail the p95 gate.  Two correct shader fixes were scored as
+    failures by that metric before this block existed.
+
+    These numbers are restricted to the samples the Lab actually wrote, so they
+    move if and only if the image changed.
+    """
+    zone = raw_field["zone"]
+    delta = lab_field["field"] - raw_field["field"]
+    touched = zone & (np.abs(delta) > 1e-6)
+    if not np.any(touched):
+        return {"touched_count": 0, "improved": 0, "degraded": 0,
+                "median_delta_code": 0.0, "worst_delta_code": 0.0,
+                "degraded_sum_code": 0.0, "untouched_p95_match": True}
+    values = delta[touched]
+    kept = zone & ~touched
+    return {
+        "touched_count": int(touched.sum()),
+        "improved": int((values < 0.0).sum()),
+        "degraded": int((values > 0.0).sum()),
+        "median_delta_code": float(np.median(values)),
+        "worst_delta_code": float(values.max()),
+        "degraded_sum_code": float(values[values > 0.0].sum()),
+        # Sanity: the untouched remainder must be identical by construction.
+        "untouched_p95_match": bool(
+            not np.any(kept) or
+            np.percentile(raw_field["field"][kept], 95.0) ==
+            np.percentile(lab_field["field"][kept], 95.0)),
+    }
+
+
 def _score_chroma(left_u: np.ndarray, left_v: np.ndarray,
                   right_u: np.ndarray, right_v: np.ndarray,
                   source_u: np.ndarray, source_v: np.ndarray,
                   depth: np.ndarray, strength_pct: float,
-                  convergence: float) -> dict[str, float]:
+                  convergence: float,
+                  out_field: dict | None = None) -> dict[str, float]:
     nearness = depth.astype(np.float32).reshape(
         source_u.shape[0], 2, source_u.shape[1], 2).mean(axis=(1, 3)) / 65535.0
     height, width = source_u.shape
@@ -231,9 +271,13 @@ def _score_chroma(left_u: np.ndarray, left_v: np.ndarray,
          _bilinear_rows(right_u.astype(np.float32), right_x)
     dv = _bilinear_rows(left_v.astype(np.float32), left_x) - \
          _bilinear_rows(right_v.astype(np.float32), right_x)
-    values = np.sqrt(du * du + dv * dv)[rivalry_zone]
+    field = np.sqrt(du * du + dv * dv)
+    values = field[rivalry_zone]
     if values.size == 0:
         raise RuntimeError("synthetic scene produced no visible chroma samples")
+    if out_field is not None:
+        out_field["field"] = field
+        out_field["zone"] = rivalry_zone
     return {
         "sample_count": int(values.size),
         "mean_code": float(values.mean()),
@@ -275,12 +319,15 @@ def main() -> int:
     lab_l, lab_u, lab_v, lab_r, lab_ur, lab_vr, lab_status = lab_planes
     raw = _score(raw_l, raw_r, source, depth, args.strength, args.convergence)
     lab = _score(lab_l, lab_r, source, depth, args.strength, args.convergence)
+    raw_field: dict = {}
+    lab_field: dict = {}
     raw_chroma = _score_chroma(
         raw_u, raw_v, raw_ur, raw_vr, source_u, source_v,
-        depth, args.strength, args.convergence)
+        depth, args.strength, args.convergence, raw_field)
     lab_chroma = _score_chroma(
         lab_u, lab_v, lab_ur, lab_vr, source_u, source_v,
-        depth, args.strength, args.convergence)
+        depth, args.strength, args.convergence, lab_field)
+    chroma_touched = _score_chroma_touched(raw_field, lab_field)
     changed = np.maximum(np.abs(lab_l.astype(np.int16) - raw_l.astype(np.int16)),
                          np.abs(lab_r.astype(np.int16) - raw_r.astype(np.int16)))
     result = {
@@ -288,6 +335,7 @@ def main() -> int:
         "lab": lab,
         "raw_chroma": raw_chroma,
         "lab_chroma": lab_chroma,
+        "chroma_touched": chroma_touched,
         "p95_improvement_pct": 100.0 * (raw["p95_code"] - lab["p95_code"]) /
                                max(raw["p95_code"], 1e-6),
         "changed_pixel_pct": float(100.0 * np.mean(changed > 0)),

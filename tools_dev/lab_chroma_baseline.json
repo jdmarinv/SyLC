@@ -1,0 +1,350 @@
+{
+  "protocol": {
+    "seeds": [
+      20260807,
+      20260808,
+      20260809,
+      20260810,
+      20260811,
+      20260812,
+      20260813,
+      20260814
+    ],
+    "width": 640,
+    "height": 360,
+    "strength": 2.4,
+    "convergence": 0.5
+  },
+  "rows": [
+    {
+      "seed": 20260807,
+      "probe_returncode": 0,
+      "probe_verdict": "",
+      "raw": {
+        "p95_code": 0.7982942199708006,
+        "p99_code": 15.506798178100006,
+        "over_8_code_pct": 1.7810218978102188,
+        "over_16_code_pct": 0.9927007299270074
+      },
+      "lab": {
+        "p95_code": 0.7389810180657435,
+        "p99_code": 8.946708959961526,
+        "over_8_code_pct": 1.0510948905109487,
+        "over_16_code_pct": 0.7007299270072992
+      },
+      "raw_chroma": {
+        "p95_code": 0.6572740546705353,
+        "p99_code": 3.43271932061326,
+        "over_8_code_pct": 0.08278145695364239,
+        "over_16_code_pct": 0.0
+      },
+      "lab_chroma": {
+        "p95_code": 0.6945821901964967,
+        "p99_code": 4.5378684962203915,
+        "over_8_code_pct": 0.08278145695364239,
+        "over_16_code_pct": 0.0
+      },
+      "chroma_touched": {
+        "touched_count": 24,
+        "improved": 5,
+        "degraded": 19,
+        "median_delta_code": 0.7090474741811896,
+        "worst_delta_code": 4.000336916510731,
+        "degraded_sum_code": 30.836194067008933
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1208,
+      "changed_pixel_pct": 0.2717013888888889,
+      "max_change_code": 92
+    },
+    {
+      "seed": 20260808,
+      "probe_returncode": 0,
+      "probe_verdict": "",
+      "raw": {
+        "p95_code": 0.5002551269508331,
+        "p99_code": 0.6242366180419278,
+        "over_8_code_pct": 0.0,
+        "over_16_code_pct": 0.0
+      },
+      "lab": {
+        "p95_code": 0.5002551269508331,
+        "p99_code": 0.6242366180419278,
+        "over_8_code_pct": 0.0,
+        "over_16_code_pct": 0.0
+      },
+      "raw_chroma": {
+        "p95_code": 0.6014884645162846,
+        "p99_code": 16.26151936721321,
+        "over_8_code_pct": 1.8932874354561102,
+        "over_16_code_pct": 1.0327022375215147
+      },
+      "lab_chroma": {
+        "p95_code": 0.6014884645162846,
+        "p99_code": 16.26151936721321,
+        "over_8_code_pct": 1.8932874354561102,
+        "over_16_code_pct": 1.0327022375215147
+      },
+      "chroma_touched": {
+        "touched_count": 19,
+        "improved": 0,
+        "degraded": 19,
+        "median_delta_code": 0.24021746300106306,
+        "worst_delta_code": 0.980903663635246,
+        "degraded_sum_code": 8.490250131767922
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1743,
+      "changed_pixel_pct": 0.11762152777777778,
+      "max_change_code": 1
+    },
+    {
+      "seed": 20260809,
+      "probe_returncode": 1,
+      "probe_verdict": "Stereo Lab increased paired chroma p95 rivalry",
+      "raw": {
+        "p95_code": 0.510246734618022,
+        "p99_code": 0.7466280301006236,
+        "over_8_code_pct": 0.3782368344486471,
+        "over_16_code_pct": 0.02909514111143439
+      },
+      "lab": {
+        "p95_code": 0.510246734618022,
+        "p99_code": 0.7466280301006236,
+        "over_8_code_pct": 0.3782368344486471,
+        "over_16_code_pct": 0.02909514111143439
+      },
+      "raw_chroma": {
+        "p95_code": 0.7316653602386888,
+        "p99_code": 47.31873709757486,
+        "over_8_code_pct": 3.0091348737238044,
+        "over_16_code_pct": 3.0091348737238044
+      },
+      "lab_chroma": {
+        "p95_code": 1.7428165214269014,
+        "p99_code": 47.31873709757486,
+        "over_8_code_pct": 4.083825900053735,
+        "over_16_code_pct": 3.2240730789897905
+      },
+      "chroma_touched": {
+        "touched_count": 41,
+        "improved": 13,
+        "degraded": 28,
+        "median_delta_code": 4.634735698648788,
+        "worst_delta_code": 17.55972068206544,
+        "degraded_sum_code": 251.7237374325727
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1861,
+      "changed_pixel_pct": 0.5047743055555556,
+      "max_change_code": 3,
+      "known_failing": "p95 RANK ARTEFACT, not a p95-level degradation. The Lab leaves ~98% of the rivalry zone bit-identical; excluding the samples it writes makes raw and Lab p95 identical to four decimals (0.6302 on 20260809, 0.7304 on 20260811). The zone p95 moves because ~40 written samples jump to the top of a ~1500-sample ranking and displace the whole tail. Read chroma_touched instead: that is the amplitude of what the Lab actually wrote. On 20260811 the Lab is NET POSITIVE there (30 improved vs 20 degraded, median -0.73). The residual real defect is on 20260809: 28 samples in chroma columns 87-89 still degraded, worst 17.6 code values after the 2026-08-08 footprint-agreement veto cut it from 36.0."
+    },
+    {
+      "seed": 20260810,
+      "probe_returncode": 0,
+      "probe_verdict": "",
+      "raw": {
+        "p95_code": 0.4649038848873229,
+        "p99_code": 0.9061546325681888,
+        "over_8_code_pct": 0.23408239700374533,
+        "over_16_code_pct": 0.23408239700374533
+      },
+      "lab": {
+        "p95_code": 0.4649038848873229,
+        "p99_code": 0.9061546325681888,
+        "over_8_code_pct": 0.23408239700374533,
+        "over_16_code_pct": 0.23408239700374533
+      },
+      "raw_chroma": {
+        "p95_code": 0.5834540579670562,
+        "p99_code": 12.936990471964547,
+        "over_8_code_pct": 1.5479876160990713,
+        "over_16_code_pct": 0.12383900928792571
+      },
+      "lab_chroma": {
+        "p95_code": 0.7408923683227971,
+        "p99_code": 14.439764800295345,
+        "over_8_code_pct": 3.0959752321981426,
+        "over_16_code_pct": 0.12383900928792571
+      },
+      "chroma_touched": {
+        "touched_count": 46,
+        "improved": 0,
+        "degraded": 46,
+        "median_delta_code": 8.932045475569282,
+        "worst_delta_code": 14.001933381544982,
+        "degraded_sum_code": 378.1321485480695
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1615,
+      "changed_pixel_pct": 0.06814236111111112,
+      "max_change_code": 6
+    },
+    {
+      "seed": 20260811,
+      "probe_returncode": 1,
+      "probe_verdict": "Stereo Lab increased paired chroma p95 rivalry",
+      "raw": {
+        "p95_code": 18.052726459503216,
+        "p99_code": 50.19798987121571,
+        "over_8_code_pct": 6.501128668171558,
+        "over_16_code_pct": 5.237020316027087
+      },
+      "lab": {
+        "p95_code": 7.332953790094905,
+        "p99_code": 33.0,
+        "over_8_code_pct": 3.9051918735891653,
+        "over_16_code_pct": 2.8442437923250563
+      },
+      "raw_chroma": {
+        "p95_code": 2.876673313032396,
+        "p99_code": 24.061801619505303,
+        "over_8_code_pct": 3.6338225017470296,
+        "over_16_code_pct": 2.4458420684835778
+      },
+      "lab_chroma": {
+        "p95_code": 3.909896754301714,
+        "p99_code": 20.55484255802732,
+        "over_8_code_pct": 3.7037037037037033,
+        "over_16_code_pct": 2.4458420684835778
+      },
+      "chroma_touched": {
+        "touched_count": 49,
+        "improved": 29,
+        "degraded": 20,
+        "median_delta_code": -0.6476326204335114,
+        "worst_delta_code": 12.35602083482609,
+        "degraded_sum_code": 87.81671199993127
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1431,
+      "changed_pixel_pct": 0.5425347222222222,
+      "max_change_code": 146,
+      "known_failing": "p95 RANK ARTEFACT, not a p95-level degradation. The Lab leaves ~98% of the rivalry zone bit-identical; excluding the samples it writes makes raw and Lab p95 identical to four decimals (0.6302 on 20260809, 0.7304 on 20260811). The zone p95 moves because ~40 written samples jump to the top of a ~1500-sample ranking and displace the whole tail. Read chroma_touched instead: that is the amplitude of what the Lab actually wrote. On 20260811 the Lab is NET POSITIVE there (30 improved vs 20 degraded, median -0.73). The residual real defect is on 20260809: 28 samples in chroma columns 87-89 still degraded, worst 17.6 code values after the 2026-08-08 footprint-agreement veto cut it from 36.0."
+    },
+    {
+      "seed": 20260812,
+      "probe_returncode": 0,
+      "probe_verdict": "",
+      "raw": {
+        "p95_code": 17.956729637145727,
+        "p99_code": 40.578144254297754,
+        "over_8_code_pct": 5.443188578227246,
+        "over_16_code_pct": 5.056513979773944
+      },
+      "lab": {
+        "p95_code": 8.38583908081033,
+        "p99_code": 39.583419827178915,
+        "over_8_code_pct": 5.086258179654967,
+        "over_16_code_pct": 4.580606781677573
+      },
+      "raw_chroma": {
+        "p95_code": 0.6364766234387916,
+        "p99_code": 0.9209559406621134,
+        "over_8_code_pct": 0.0,
+        "over_16_code_pct": 0.0
+      },
+      "lab_chroma": {
+        "p95_code": 1.0014648793571057,
+        "p99_code": 10.469772311311736,
+        "over_8_code_pct": 1.2974976830398517,
+        "over_16_code_pct": 0.0
+      },
+      "chroma_touched": {
+        "touched_count": 76,
+        "improved": 5,
+        "degraded": 71,
+        "median_delta_code": 1.2486860724288658,
+        "worst_delta_code": 12.404478244359757,
+        "degraded_sum_code": 249.7746517943948
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1079,
+      "changed_pixel_pct": 0.12369791666666666,
+      "max_change_code": 88
+    },
+    {
+      "seed": 20260813,
+      "probe_returncode": 0,
+      "probe_verdict": "",
+      "raw": {
+        "p95_code": 0.5162518310547739,
+        "p99_code": 8.26088317871097,
+        "over_8_code_pct": 1.1788256227758007,
+        "over_16_code_pct": 0.8451957295373667
+      },
+      "lab": {
+        "p95_code": 0.5162518310547739,
+        "p99_code": 8.26088317871097,
+        "over_8_code_pct": 1.2677935943060499,
+        "over_16_code_pct": 0.8451957295373667
+      },
+      "raw_chroma": {
+        "p95_code": 32.2711227437537,
+        "p99_code": 79.3762680200489,
+        "over_8_code_pct": 5.676567656765676,
+        "over_16_code_pct": 5.2805280528052805
+      },
+      "lab_chroma": {
+        "p95_code": 17.57292041376333,
+        "p99_code": 78.00783684264991,
+        "over_8_code_pct": 6.204620462046204,
+        "over_16_code_pct": 5.6105610561056105
+      },
+      "chroma_touched": {
+        "touched_count": 92,
+        "improved": 12,
+        "degraded": 80,
+        "median_delta_code": 2.1989509000266594,
+        "worst_delta_code": 119.07799501442592,
+        "degraded_sum_code": 1180.0165374252247
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1515,
+      "changed_pixel_pct": 0.16449652777777776,
+      "max_change_code": 48
+    },
+    {
+      "seed": 20260814,
+      "probe_returncode": 0,
+      "probe_verdict": "",
+      "raw": {
+        "p95_code": 0.5391733819971023,
+        "p99_code": 0.6473345801580246,
+        "over_8_code_pct": 0.0,
+        "over_16_code_pct": 0.0
+      },
+      "lab": {
+        "p95_code": 0.5391733819971023,
+        "p99_code": 0.6473345801580246,
+        "over_8_code_pct": 0.0,
+        "over_16_code_pct": 0.0
+      },
+      "raw_chroma": {
+        "p95_code": 0.5339927880603991,
+        "p99_code": 0.8892183746300418,
+        "over_8_code_pct": 0.10476689366160294,
+        "over_16_code_pct": 0.10476689366160294
+      },
+      "lab_chroma": {
+        "p95_code": 0.8791453611749505,
+        "p99_code": 7.325362055582979,
+        "over_8_code_pct": 0.8905185961236249,
+        "over_16_code_pct": 0.5762179151388162
+      },
+      "chroma_touched": {
+        "touched_count": 86,
+        "improved": 3,
+        "degraded": 83,
+        "median_delta_code": 3.417917586624748,
+        "worst_delta_code": 20.27955487655671,
+        "degraded_sum_code": 421.39325984454786
+      },
+      "untouched_p95_match": true,
+      "chroma_sample_count": 1909,
+      "changed_pixel_pct": 0.0837673611111111,
+      "max_change_code": 1
+    }
+  ]
+}

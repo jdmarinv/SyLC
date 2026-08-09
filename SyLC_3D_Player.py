@@ -47,9 +47,11 @@ from sylc.synth3d_aspect import (
     MIN_NATIVE_WIDE_RATIO,
     select_installed_aspect_model,
 )
-from sylc.synth3d_stereo_comfort import (
-    StereoComfortEnvelope,
-    StereoDisplayGeometry,
+from sylc.stereo_calibration_dialog import (
+    StereoCalibrationWizard,
+    calibration_is_complete,
+    load_calibration_profile,
+    save_calibration,
 )
 from sylc.stereo_eye_order import (
     LEFT_FIRST, RIGHT_FIRST, UNKNOWN, normalise_eye_order,
@@ -976,48 +978,11 @@ class PlayerWindow(
             self._app_settings.get('synth3d_auto_convergence', False))
         self._synth3d_temporal_fill = bool(
             self._app_settings.get('synth3d_temporal_fill', False))
-        # Calibrated binocular comfort profile for the author's Full-HD
-        # projector: 2.5 m image width at 3.5 m. The physical screen height is
-        # retained for the future vertical/window analysis; horizontal
-        # disparity depends on the illuminated image width.
-        try:
-            def _comfort_number(env_key, setting_key, default):
-                return float(os.environ.get(
-                    env_key, self._app_settings.get(setting_key, default)))
-
-            # v5.2.1c owns the displayed disparity again. Retain this physical
-            # geometry for Lab metrics, but never restore a persisted comfort
-            # corrector on top of the reference warp.
-            self._synth3d_comfort_enabled = False
-            self._synth3d_comfort_screen_height_m = _comfort_number(
-                'SYLC_COMFORT_SCREEN_HEIGHT_M',
-                'synth3d_comfort_screen_height_m', 1.7)
-            _geometry = StereoDisplayGeometry(
-                screen_width_m=_comfort_number(
-                    'SYLC_COMFORT_SCREEN_WIDTH_M',
-                    'synth3d_comfort_screen_width_m', 2.5),
-                horizontal_pixels=int(round(_comfort_number(
-                    'SYLC_COMFORT_HORIZONTAL_PIXELS',
-                    'synth3d_comfort_horizontal_pixels', 1920))),
-                viewing_distance_m=_comfort_number(
-                    'SYLC_COMFORT_VIEWING_DISTANCE_M',
-                    'synth3d_comfort_viewing_distance_m', 3.5),
-                interpupillary_distance_m=_comfort_number(
-                    'SYLC_COMFORT_IPD_M', 'synth3d_comfort_ipd_m', 0.064))
-            self._synth3d_comfort_envelope = StereoComfortEnvelope(
-                _geometry,
-                soft_vac_diopters=_comfort_number(
-                    'SYLC_COMFORT_SOFT_VAC_D',
-                    'synth3d_comfort_soft_vac_d', 0.18),
-                hard_vac_diopters=_comfort_number(
-                    'SYLC_COMFORT_HARD_VAC_D',
-                    'synth3d_comfort_hard_vac_d', 0.30))
-        except (TypeError, ValueError, OverflowError):
-            logger.exception("[2D3D] invalid comfort profile; keeping v5.2.1c baseline")
-            self._synth3d_comfort_enabled = False
-            self._synth3d_comfort_screen_height_m = 1.7
-            self._synth3d_comfort_envelope = StereoComfortEnvelope(
-                StereoDisplayGeometry(2.5, 1920, 3.5, 0.064))
+        # Physical geometry is loaded before any synthesis surface exists. The
+        # native engine projects its authoritative disparity once through this
+        # envelope; Stereo Lab then audits that same projection passively.
+        self._reload_synth3d_comfort_profile()
+        self._stereo_calibration_open = False
         self._synth3d_depth_view = False
         self._synth3d_diagnostics = False
         # (absolute square-model path, square side, AspectSelection). Kept for
@@ -1029,11 +994,19 @@ class PlayerWindow(
         # tells _on_framepacking_visibility_changed that the framepack hide it is
         # about to see is deliberate and momentary.
         self._synth3d_rearming = False
-        self._synth3d_preset = str(
+        _stored_geometry_preset = str(
             self._app_settings.get('synth3d_preset', 'custom')).lower()
-        if self._synth3d_preset not in {
-                'comfort', 'cinema', 'immersion', 'custom'}:
-            self._synth3d_preset = 'custom'
+        self._synth3d_preset = self._normalise_synth3d_preset(
+            _stored_geometry_preset)
+        if _stored_geometry_preset == 'immersion':
+            self._synth3d_strength, self._synth3d_convergence = \
+                self._SYNTH3D_PRESETS['cinema']
+            self._app_settings.update({
+                'synth3d_preset': 'cinema',
+                'synth3d_strength_pct': self._synth3d_strength,
+                'synth3d_convergence': self._synth3d_convergence,
+            })
+            self._save_app_settings()
         # MatAnyone 2 is an optional, isolated CUDA worker. "auto" is the
         # production default: it starts only when the complete offline runtime
         # is installed, and otherwise leaves the depth-only renderer untouched.
@@ -1242,10 +1215,56 @@ class PlayerWindow(
         # without a modal. Someone who opened the player to watch a Blu-ray
         # should not be met by a 4.6 GB prompt.
         QTimer.singleShot(2000, self._maybe_prompt_for_models)
+        # A room profile belongs to this installation, not to a media file.
+        # Cancellation deliberately leaves it incomplete so the assistant is
+        # offered again on the next launch.
+        QTimer.singleShot(500, self._maybe_prompt_stereo_calibration)
 
         print("[STARTUP] PlayerWindow initialized successfully")
 
     # ----- Media-session ownership ---------------------------------------
+
+    def _reload_synth3d_comfort_profile(self):
+        """Rebuild the one active physical envelope from persisted settings."""
+        try:
+            profile = load_calibration_profile(self._app_settings)
+        except (TypeError, ValueError, OverflowError):
+            logger.exception(
+                "[2D3D] invalid comfort profile; using safe calibrated defaults")
+            profile = load_calibration_profile({}, environ={})
+        self._synth3d_comfort_enabled = profile.enabled
+        self._synth3d_comfort_screen_height_m = profile.screen_height_m
+        self._synth3d_comfort_envelope = profile.envelope
+
+    def _maybe_prompt_stereo_calibration(self):
+        if not calibration_is_complete(self._app_settings):
+            self._open_stereo_calibration()
+
+    def _open_stereo_calibration(self):
+        """Open the first-run wizard, also reachable later from the AI menu."""
+        if self._stereo_calibration_open or self._app_closing:
+            return
+        self._stereo_calibration_open = True
+        wizard = StereoCalibrationWizard(self._app_settings, self)
+        try:
+            if not wizard.exec():
+                return
+            profile = save_calibration(
+                self._app_settings, wizard.calibration_values())
+            self._save_app_settings()
+            # Reload through the normal environment-aware path: lab overrides
+            # retain priority, while an ordinary installation uses `profile`.
+            self._reload_synth3d_comfort_profile()
+            self._push_synth3d_to_widgets()
+            state = "enabled" if profile.enabled else "disabled"
+            geometry = profile.envelope.geometry
+            self.show_3d_notification(
+                f"Stereo Lab calibrated: {geometry.screen_width_m:.2f} m at "
+                f"{geometry.viewing_distance_m:.2f} m · comfort {state}",
+                success=True)
+        finally:
+            self._stereo_calibration_open = False
+            wizard.deleteLater()
 
     def _maybe_prompt_for_models(self):
         try:
@@ -1357,6 +1376,8 @@ class PlayerWindow(
             self._synth3d_set_depth_preset)
         self.controls_overlay.synth3d_download_models_requested.connect(
             self._open_model_download_dialog)
+        self.controls_overlay.synth3d_calibration_requested.connect(
+            self._open_stereo_calibration)
         self.controls_overlay.synth3d_strength_preview.connect(
             lambda v: self.set_synth3d_strength(v, persist=False))
         self.controls_overlay.synth3d_strength_changed.connect(self.set_synth3d_strength)

@@ -41,12 +41,29 @@ class Synth3DCoordinationMixin:
 
     _SYNTH3D_PRESETS = {
         # strength is % of image width; convergence is normalized nearness.
-        # Comfort keeps most content behind the screen plane, Cinema balances
-        # positive/negative parallax, Immersion permits more foreground pop.
+        # Comfort keeps most content behind the screen plane; Cinema balances
+        # positive and negative parallax.
         'comfort': (0.8, 0.62),
         'cinema': (1.4, 0.52),
-        'immersion': (2.2, 0.42),
     }
+
+    @classmethod
+    def _normalise_synth3d_preset(cls, name):
+        """Normalize persisted geometry choices after preset retirement.
+
+        Immersion was the former high-parallax option. Existing installs move
+        to Cinema rather than keeping a hidden preset whose values no longer
+        match anything the UI can select.
+        """
+        name = str(name or '').lower()
+        if name == 'immersion':
+            return 'cinema'
+        return name if name in {*cls._SYNTH3D_PRESETS, 'custom'} else 'custom'
+
+    # The scout leads presentation by at most its decoded-future window
+    # (~12 frames).  Anything beyond a handful of cuts waiting at once means
+    # the pump has stopped draining, not that the film cut that fast.
+    SYNTH3D_MAX_PENDING_CUTS = 8
 
     def _synth3d_lookahead_thread(self):
         """Return the decoder that owns decoded-future shot information.
@@ -440,7 +457,7 @@ class Synth3DCoordinationMixin:
             self._update_synth3d_menu_state()
             return
         self._synth3d_active = bool(enabled)
-        self._synth3d_pending_cut_pts = None
+        self._synth3d_pending_cuts = []
         self._synth3d_matte_cut_seen_ms = -math.inf
         self._synth3d_matte_floor_pts_ms = -math.inf
         # Arm synchronously. Waiting for the 100 ms timeline pump leaves a
@@ -523,6 +540,18 @@ class Synth3DCoordinationMixin:
         """Start the optional MatAnyone 2 process without blocking playback."""
         if not getattr(self, '_synth3d_matting_requested', True):
             return False
+        # Kill-switch. Turning 2D->3D off disables the depth service AND the
+        # matte together, so it cannot say which of the two is involved in a
+        # freeze; this leaves depth running and takes the MatAnyone CUDA
+        # worker out of the picture, which is the one variable that separates
+        # "the TensorRT engine stalls on its own" from "it stalls contending
+        # with a second CUDA process".
+        if os.environ.get("SYLC_SYNTH3D_MATTE", "1") == "0":
+            if not getattr(self, '_synth3d_matte_off_logged', False):
+                self._synth3d_matte_off_logged = True
+                logger.info("[MATANYONE2] disabled by SYLC_SYNTH3D_MATTE=0; "
+                            "depth-only 2D->3D")
+            return False
 
         service = getattr(self, '_synth3d_matte_service', None)
         if service is not None and service.running:
@@ -579,24 +608,66 @@ class Synth3DCoordinationMixin:
         seen = float(getattr(self, '_synth3d_matte_cut_seen_ms', -math.inf))
         if cut <= seen + 0.5:
             return False
-        pending = getattr(self, '_synth3d_pending_cut_pts', None)
-        if pending is None or cut < float(pending) - 0.5:
-            self._synth3d_pending_cut_pts = cut
-            return True
-        return False
+        # A QUEUE, not a slot.  The single scalar this replaced kept the
+        # EARLIEST pending cut and returned False for anything later, so a cut
+        # arriving while another waited for its presentation was dropped
+        # silently -- no counter, no log.  The window is exactly the scout's
+        # lead (up to 12 decoded frames, ~500 ms), so short shots, shot/
+        # reverse-shot and fast montage land two cuts inside it routinely.
+        # Measured before this change: 30 boundaries consumed by the depth
+        # path against 23 matte epoch advances on the same run -- 23% of cuts
+        # left the matte holding the previous shot's silhouette.
+        pending = getattr(self, '_synth3d_pending_cuts', None)
+        if pending is None:
+            pending = self._synth3d_pending_cuts = []
+        for existing in pending:
+            if abs(existing - cut) <= 0.5:
+                return False
+        pending.append(cut)
+        pending.sort()
+        if len(pending) > self.SYNTH3D_MAX_PENDING_CUTS:
+            # Drop the FARTHEST future, never the imminent one.  Evicting
+            # pending[0] self-sustains: the advisory pump reports events[0] --
+            # the nearest cut -- every 100 ms, so an evicted imminent cut is
+            # re-added, sorts back to index 0 and is evicted again, forever.
+            # Measured at 10 drops/second on a 27-cut passage.  A cut dropped
+            # from the far end costs nothing: the pump re-learns it once it
+            # comes near.
+            pending.pop()
+            self._synth3d_cuts_dropped = getattr(
+                self, '_synth3d_cuts_dropped', 0) + 1
+            # Rate-limited: a per-event warning at pump cadence buries the log
+            # it was added to make readable.
+            if self._synth3d_cuts_dropped % 32 == 1:
+                logger.warning(
+                    "[MATANYONE2] pending-cut queue full, farthest boundary "
+                    "dropped (total %d)", self._synth3d_cuts_dropped)
+        return True
 
     def _synth3d_apply_matte_cut_if_due(self, video_time_ms, service):
         """Advance the matte shot epoch exactly on the first T0 presentation."""
-        pending = getattr(self, '_synth3d_pending_cut_pts', None)
-        if pending is None:
+        pending = getattr(self, '_synth3d_pending_cuts', None)
+        if not pending:
             return False
         try:
             pts = float(video_time_ms)
-            cut = float(pending)
         except (TypeError, ValueError):
             return False
-        if not math.isfinite(pts) or pts < cut - 0.5:
+        if not math.isfinite(pts):
             return False
+        due = [c for c in pending if pts >= c - 0.5]
+        if not due:
+            return False
+        # Normally exactly one is due and the queue drains one cut per
+        # presentation.  Several at once means their shots went by faster than
+        # this pump ran: one reset is all that can still be done, so advance to
+        # the LAST of them and count the rest -- a coalesce is not a drop, but
+        # it is not a clean reset either and must not be invisible.
+        cut = due[-1]
+        if len(due) > 1:
+            self._synth3d_cuts_coalesced = getattr(
+                self, '_synth3d_cuts_coalesced', 0) + len(due) - 1
+        self._synth3d_pending_cuts = [c for c in pending if c > cut + 0.5]
 
         # Generation changes first.  A result already being inferred by the
         # CUDA worker may arrive before it reads the reset control, but the
@@ -604,7 +675,6 @@ class Synth3DCoordinationMixin:
         service.reset(f"shot boundary @{cut:.3f} ms")
         self._synth3d_matte_cut_seen_ms = cut
         self._synth3d_matte_floor_pts_ms = cut
-        self._synth3d_pending_cut_pts = None
         clear_matte = getattr(self, '_synth3d_clear_human_matte', None)
         if clear_matte is not None:
             clear_matte()
@@ -1034,7 +1104,14 @@ class Synth3DCoordinationMixin:
         self._update_synth3d_status_label(st)
         now = time.monotonic()
         last = getattr(self, '_synth3d_poll_last_log', 0.0)
-        if now - last >= 10.0:
+        # A 10 s line averages away exactly the question a flicker poses.
+        # SYLC_SYNTH3D_STATUS_EVERY=0 logs every poll instead, for a
+        # diagnostic run paired with SYLC_STEREO_LAB_METRIC_EVERY=1.
+        try:
+            period = float(os.environ.get("SYLC_SYNTH3D_STATUS_EVERY", "10"))
+        except ValueError:
+            period = 10.0
+        if now - last >= period:
             logger.info("[2D3D] %s", st)
             # Scout coverage beside the engine line: a hard cut the scout
             # DETECTED but never surfaced produces no hold at all downstream.
@@ -1218,7 +1295,7 @@ class Synth3DCoordinationMixin:
         matte_service = getattr(self, '_synth3d_matte_service', None)
         if matte_service is not None:
             matte_service.reset("media seek")
-        self._synth3d_pending_cut_pts = None
+        self._synth3d_pending_cuts = []
         self._synth3d_matte_cut_seen_ms = -math.inf
         self._synth3d_matte_floor_pts_ms = -math.inf
         clear_matte = getattr(self, '_synth3d_clear_human_matte', None)
@@ -1343,7 +1420,7 @@ class Synth3DCoordinationMixin:
         for name, action in ov.synth3d_preset_actions.items():
             action.blockSignals(True)
             action.setChecked(name == selected)
-            action.setEnabled(bool(self._synth3d_active) or name == 'custom')
+            action.setEnabled(bool(self._synth3d_active))
             action.blockSignals(False)
         # Depth presets, unlike the comfort ones, are pickable with synthesis
         # idle too (the choice then applies to the next enable). A preset with no

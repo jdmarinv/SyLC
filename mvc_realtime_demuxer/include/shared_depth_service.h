@@ -148,7 +148,8 @@ void compute_boundary(const std::vector<float>& depth,
                       int width, int height,
                       std::vector<float>& boundary,
                       std::vector<float>& scratch,
-                      int max_threads = 1);
+                      int max_threads = 1,
+                      std::vector<float>* fine_structure = nullptr);
 void refine_observation(std::vector<float>& depth,
                         const std::vector<float>& luma,
                         const std::vector<float>& confidence,
@@ -171,7 +172,7 @@ void refine_observation(std::vector<float>& depth,
 // side. Symmetric: also recovers an arm eaten by the background. Runs on
 // the published q16 after stabilization; the image edge is temporally
 // stable, so this also damps contour breathing. X then Y pass, bit-exact
-// at any thread count. SYLC_SYNTH3D_REALIGN=0 disables the worker call.
+// at any thread count.
 void realign_contours(std::vector<uint16_t>& depth_q16,
                       const std::vector<float>& luma,
                       int width, int height,
@@ -216,6 +217,11 @@ public:
     // ownership/safety directly into its device-local RG16 warp texture.
     struct GeometryFrame {
         bool gpu_ownership = false;
+        // Renderer-local temporal filters must never carry state across a
+        // cut/seek. source_dt_ms makes their release rate invariant to source
+        // cadence while reproducing the validated 23.976-fps response.
+        bool temporal_reset = false;
+        float source_dt_ms = 1000.0f * 1001.0f / 24000.0f;
         GeometryMap geometry;
         GeometryMap surface_rgba16; // depth, luma, confidence, boundary
         GeometryMap rgb_rgba16;     // linear RGB, reserved alpha
@@ -309,7 +315,12 @@ public:
         return snapshot(after_sequence, sequence, ignored_video_ms);
     }
 
-    void notify_seek();
+    // `cause` is diagnostic only: 0 = a real seek, 1 = a geometry/format
+    // change (Synth3D::ensure_warp treats it "exactly like a seek"), 2 =
+    // first client attach. Same effect for all three; the split exists
+    // because they are indistinguishable on screen and have different fixes.
+    enum ResetCause { kResetSeek = 0, kResetGeometry = 1, kResetAttach = 2 };
+    void notify_seek(int cause = kResetSeek);
     bool running() const;
     bool failed() const;
     int client_count() const;
@@ -367,7 +378,10 @@ public:
     // absolute pts (ahead of presentation) and the worker's own snap pts
     // (authoritative, later) both land here; duplicates within half a frame
     // merge. notify_seek() purges the list (pre-seek timeline).
-    void note_cut_pts(double pts_ms);
+    // from_scout separates the two independent observers so a merge
+    // storm can be attributed: the scout (decoded-future, forwarded by
+    // the player) or the worker's own post-hoc snap.
+    void note_cut_pts(double pts_ms, bool from_scout = false);
 
     // Codec motion hints (phase 1, 04/08): the decoder's per-frame block
     // motion field, keyed by media pts. Quarter-pel per DISPLAY frame,
@@ -561,6 +575,12 @@ private:
     // mutable: cross_shot() prunes long-passed boundaries in place (cache
     // maintenance, observably const).
     mutable std::vector<double> cut_pts_;
+    // Parallel to cut_pts_: has this boundary ever been crossed?  Only an
+    // UNCONSUMED boundary that expires is a lost cut, so the flag is what
+    // separates "dropped" from "correctly retired".
+    mutable std::vector<char> cut_consumed_;
+    // Sort cut_pts_ keeping cut_consumed_ aligned.  Called under cut_pts_mtx_.
+    void sort_cut_boundaries() const;
     // Presents flattened by the cross-shot gate (diagnostic `gate=` in
     // status). Counted per SURFACE present, so like la_stale it scales with
     // the number of reading surfaces — normalize before comparing runs.
@@ -658,6 +678,22 @@ private:
     // point at completely different fixes, so they are counted apart.
     std::atomic<uint64_t> drain_empty_{0};
     std::atomic<uint64_t> drain_stalled_{0};
+    // Stabilizer resets, split by CAUSE. A reset makes the worker discard the
+    // in-flight map instead of publishing it, so a reset arriving every frame
+    // is indistinguishable from a freeze on screen while the worker, the pipe
+    // and the audio all stay perfectly healthy. Only a per-cause count can say
+    // whether a still image means "blocked" or "resetting"; `map_reset_` counts
+    // the resets the worker actually consumed, so a storm is visible in normal
+    // operation and not only in a post-mortem.
+    // Every wants_input() call, and the subset refused because the worker has
+    // not yet taken the previous map. See the comment at that refusal.
+    std::atomic<uint64_t> taps_{0};
+    std::atomic<uint64_t> input_busy_{0};
+    std::atomic<uint64_t> reset_seek_{0};
+    std::atomic<uint64_t> reset_geom_{0};
+    std::atomic<uint64_t> reset_attach_{0};
+    std::atomic<uint64_t> map_reset_{0};
+    std::atomic<uint64_t> map_dropped_{0};
     // Plate-vs-cut accounting. plate_post_ counts presents where the plate was
     // LIVE while the advisory still remembered a cut within the last 500 ms —
     // i.e. after the -150 ms hold released it. plate_cut_in_ is the advisory
@@ -691,6 +727,168 @@ private:
     std::atomic<uint64_t> cut_boundary_{0};
     std::atomic<uint64_t> cut_source_{0};
     std::atomic<uint64_t> cut_depth_{0};
+    // Life of a scout boundary, which is the PRIMARY cut path: the scout
+    // analyses decoded-future frames at 64px and publishes the boundary
+    // before presentation.  Until these existed, a boundary that was recorded
+    // and then expired unconsumed was indistinguishable from one that was
+    // never published -- and `cut_bnd` counts only the consumed ones, so the
+    // loss was invisible.  bnd_rec = accepted as a new boundary, bnd_mrg =
+    // merged into an existing one within the 21 ms window (scout and worker
+    // reporting the same cut), bnd_exp = pruned at the 4 s media horizon
+    // WITHOUT ever having been crossed, i.e. a cut seen and then dropped.
+    mutable std::atomic<uint64_t> cut_recorded_{0};
+    mutable std::atomic<uint64_t> cut_merged_{0};
+    mutable std::atomic<uint64_t> cut_expired_{0};
+    // Peak source-histogram distance since the last status read.  `scene=` is
+    // an instantaneous sample taken every ~10 s, so it lands on a cut frame
+    // essentially never and cannot answer whether the fallback leg's signal
+    // ever reaches scene_cut_threshold on this content.
+    mutable std::atomic<uint32_t> scene_peak_bits_{0};
+    // Media pts of the last observation the worker consumed, so the scout's
+    // thread can tell whether the boundary it is recording is already behind
+    // the playhead.  bnd_late counts exactly those.
+    std::atomic<double> consumed_video_ms_{-1.0};
+    mutable std::atomic<uint64_t> cut_late_{0};
+    // A boundary that lands AT or just behind the last consumed observation
+    // can never satisfy cross_shot_gate's strict containment: `previous <
+    // boundary` fails for every interval afterwards.  It is not a rare race
+    // -- the scout dates a cut at the NEW shot's first frame, which is
+    // exactly the frame the worker just consumed, so the common case is a
+    // dead boundary.  Measured lateness: 0 to 42 ms, i.e. zero to one frame
+    // at 23.976, never seconds.  Carrying it to the NEXT observation turns a
+    // missed reset into a one-frame-late reset.  The grace is bounded so a
+    // genuinely old boundary can never snap in the middle of the next shot.
+    static constexpr double kLateBoundaryGraceMs = 120.0;
+    std::atomic<bool> boundary_pending_{false};
+    mutable std::atomic<uint64_t> cut_carried_{0};
+    // Merge storm attribution.  bnd_twin is the decisive one: a boundary
+    // recorded as NEW while another already sits within kTwinWindowMs means
+    // the two observers dated the SAME cut more than the 21 ms merge window
+    // apart, so one cut becomes two boundaries -- and the renderer, which
+    // de-dupes on plate_cut_seen_ms_ + jitter, invalidates its plate a second
+    // time in the middle of the following shot.
+    static constexpr double kTwinWindowMs = 200.0;
+    mutable std::atomic<uint64_t> cut_twin_{0};
+    // Written by the inference thread itself, read by status() from another
+    // thread.  It cannot live on the InferPipe: that object is a local of
+    // worker_main, and a frozen worker copies nothing -- which is precisely
+    // the state we need to report from.
+    std::atomic<int> ipipe_phase_{0};
+    std::atomic<int64_t> ipipe_since_ms_{0};
+    // Worker-side twin of the pipe heartbeat.  ipipe=job_wait proved the
+    // inference thread is healthy and merely starved, so the block is
+    // upstream in worker_main -- which holds its own unbounded waits: the
+    // input drain and two std::future::get() on pool flow tasks.  Same
+    // contract: written before entering a wait, so a frozen worker reports
+    // where.
+    std::atomic<int> wphase_{0};
+    std::atomic<int64_t> wphase_since_ms_{0};
+
+    void mark_worker_phase(int phase) {
+        wphase_.store(phase, std::memory_order_relaxed);
+        wphase_since_ms_.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+    }
+    int64_t wphase_age_ms() const {
+        const int64_t since = wphase_since_ms_.load(std::memory_order_relaxed);
+        if (since <= 0) return 0;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() - since;
+    }
+    // Every region of worker_main is named and the marker is NEVER cleared back
+    // to "run": a phase therefore reads as the last region ENTERED, and its age
+    // as the time spent there. The previous scheme restored 0 after each wait,
+    // so a freeze anywhere else reported "run" -- true but useless, and it cost
+    // a whole reproduction round to learn that.
+    static const char* wphase_name(int phase) {
+        switch (phase) {
+            case 1: return "input";
+            case 2: return "prep";
+            case 3: return "submit";
+            case 4: return "result";
+            case 5: return "flow_get";
+            case 6: return "future_get";
+            case 7: return "finish";
+            case 8: return "publish";
+            case 9: return "recycle";
+            case 10: return "drain_join";
+            case 11: return "drain_res";
+            case 12: return "retry_sub";
+            case 13: return "retry_res";
+            default: return "run";
+        }
+    }
+
+    // How long the inference thread has been in its current phase.  A frozen
+    // pipe shows this climbing while every other timing in the line stays at
+    // its last live value -- that contrast is the whole point.
+    int64_t ipipe_age_ms() const {
+        const int64_t since =
+            ipipe_since_ms_.load(std::memory_order_relaxed);
+        if (since <= 0) return 0;
+        const int64_t now =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        return now - since;
+    }
+    // Histogram of "distance to the nearest boundary already held" at the
+    // moment a NEW one is recorded.  Buckets: <21 (impossible, merged), <42,
+    // <84, <200, <500, <2000, beyond.  Single-owner thread under cut_pts_mtx_.
+    mutable uint64_t cut_gap_bins_[7] = {0, 0, 0, 0, 0, 0, 0};
+    mutable std::atomic<uint64_t> cut_scout_{0};
+    // NEW boundaries split by origin. cut_scout_ counts every call including
+    // merges, which cannot attribute the over-recording: the pipeline holds
+    // 47 boundaries/min where the scout publishes 8.6 and the worker's own
+    // depth cuts run at 24.7. Only a split on the RECORDING path says whether
+    // a depth cut -- which has already cleared the history when it fired --
+    // is also leaving a boundary behind to clear it a second time.
+    mutable std::atomic<uint64_t> cut_rec_scout_{0};
+    mutable std::atomic<uint64_t> cut_rec_worker_{0};
+    mutable std::atomic<uint32_t> merge_peak_bits_{0};
+
+    std::string cut_gap_histogram() const {
+        std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+        std::string out;
+        for (size_t i = 0; i < 7; ++i) {
+            if (i) out += ',';
+            out += std::to_string(cut_gap_bins_[i]);
+        }
+        return out;
+    }
+
+    float merge_peak() const {
+        const uint32_t bits =
+            merge_peak_bits_.exchange(0u, std::memory_order_relaxed);
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+    // Worst lateness in media ms since the last status read.  A catch-up rule
+    // is only safe if a late boundary is late by a frame or two; one that is
+    // seconds behind would snap in the MIDDLE of the following shot, which is
+    // worse than the miss it repairs.  The bound has to come from this number.
+    mutable std::atomic<uint32_t> late_peak_bits_{0};
+
+    float late_peak() const {
+        const uint32_t bits =
+            late_peak_bits_.exchange(0u, std::memory_order_relaxed);
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    // Read-and-arm: returns the peak since the previous call and restarts the
+    // window, so each status line describes its own interval instead of one
+    // ever-growing maximum that stops being informative after the first cut.
+    float scene_peak() const {
+        const uint32_t bits =
+            scene_peak_bits_.exchange(0u, std::memory_order_relaxed);
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     std::atomic<float> depth_residual_{0.0f};
     // Ambient residual baseline the adaptive depth-cut gate compares against
     // (depthbase= in the [2D3D] line): tune cut_baseline_gain with evidence.
