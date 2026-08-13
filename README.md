@@ -350,4 +350,5 @@ optional TensorRT flow.
 
 *If SyLC brought one of your discs back to life, that's the whole reward. Long live open source. 🥂*
 
+[![Hits](https://hits.sh/github.com/5ymph0en1x/SyLC.svg?view=today-total&style=plastic&labelColor=007ec6)](https://hits.sh/github.com/5ymph0en1x/SyLC/)
 </div>
