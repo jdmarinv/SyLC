@@ -88,6 +88,11 @@ class MediaSessionMixin:
         self._loading_session_id = None
         self._pgs_startup_pending_session = None
         self._mpv_transition_in_progress = False
+        if hasattr(self, 'loading_overlay') and self.loading_overlay:
+            try:
+                self.loading_overlay.hide_loading(immediate=True)
+            except Exception:
+                pass
         if self.player is not None and self.current_file_path:
             self._install_mpv_media_observers(session_id, self.player)
         if message:
@@ -142,6 +147,8 @@ class MediaSessionMixin:
         caller): async unload now, deferred terminate once cooled."""
         self._remove_mpv_media_observers(dying)
         self._remove_mpv_subtext_observer(dying)
+        if sys.platform == 'darwin':
+            self.video_widget.detach_player()
         self._mpv_dying = dying
         try:
             dying.command('stop')
@@ -242,7 +249,7 @@ class MediaSessionMixin:
 
     def _setup_mpv_player(self):
         """Advanced MPV configuration with 3D support."""
-        if not self.video_widget.winId():
+        if sys.platform != 'darwin' and not self.video_widget.winId():
             logger.warning("winId not available, retrying in 100ms.")
             QTimer.singleShot(100, self._setup_mpv_player)
             return
@@ -255,11 +262,10 @@ class MediaSessionMixin:
             logger.info("[MPV] _setup_mpv_player: instance already alive — skipping re-init")
             return
 
-        win_id = str(int(self.video_widget.winId()))
-        logger.info(f"Configuring MPV with winId: {win_id}")
+        win_id = str(int(self.video_widget.winId())) if sys.platform != 'darwin' else None
+        logger.info("Configuring MPV with %s", f"winId: {win_id}" if win_id else "libmpv render API")
 
         mpv_config = {
-            'wid': win_id,
             # === VIDEO OUTPUT ===
             'vo': 'gpu-next',
 
@@ -277,6 +283,8 @@ class MediaSessionMixin:
             # Ensure proper GPU processing for HDR
             'gpu-dumb-mode': 'no',
         }
+        if win_id:
+            mpv_config['wid'] = win_id
 
         if sys.platform == 'win32':
             # === WINDOWS / RTX 4090 OPTIMIZATIONS ===
@@ -372,16 +380,14 @@ class MediaSessionMixin:
                 'd3d11-output-csp': 'pq',
             })
         elif sys.platform == 'darwin':
-            vulkan_icd = '/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json'
-            if os.path.isfile(vulkan_icd):
-                os.environ['VK_ICD_FILENAMES'] = vulkan_icd
             mpv_config.update({
-                'vo': 'gpu-next',
-                'gpu-api': 'vulkan',
+                'vo': 'libmpv',
                 'hwdec': 'videotoolbox',
-                'macos-app-activation-policy': 'accessory',
-                'border': 'no',
+                'input-default-bindings': False,
             })
+            # --wid is a native window handle, not a libmpv render target.
+            # The OpenGL render API paints into video_widget instead.
+            mpv_config.pop('wid', None)
 
         # A core detached by Stop may still be cooling toward its deferred
         # terminate. Two cores must never overlap on the same wid HWND —
@@ -392,6 +398,8 @@ class MediaSessionMixin:
             if MPV_MODULE is None:
                 raise RuntimeError("python-mpv support has not been configured")
             self.player = MPV_MODULE.MPV(**mpv_config)
+            if sys.platform == 'darwin':
+                self.video_widget.attach_player(self.player, MPV_MODULE)
             self.player['msg-level'] = 'all=info'
             logger.info("MPV instance created successfully.")
             self._vu_timer.start()   # begin polling audio levels for the VU meter
@@ -430,12 +438,14 @@ class MediaSessionMixin:
             self.player = None
             if failed_core is not None:
                 try:
+                    if sys.platform == 'darwin':
+                        self.video_widget.detach_player()
                     failed_core.terminate()
                 except Exception:
                     pass
             if not getattr(self, '_app_closing', False):
                 QMessageBox.critical(self, "MPV Error",
-                                     f"Error initializing mpv: {e}\n\nMake sure runtime/mpv-2.dll is installed.")
+                                     f"Error initializing mpv: {e}")
 
     def on_end_of_file(self, _, reached, session_id=None, core=None):
         """mpv-thread callback: marshal EOF with immutable ownership metadata."""

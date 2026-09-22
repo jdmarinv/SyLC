@@ -74,15 +74,9 @@ class WindowPresentationMixin:
                 return False
 
         try:
-            # Le hover Qt n'est fiable que SANS HUD stéréo : en mode HUD (mono
-            # comme pilote/FramePack), la barre capturée/remappée garde un
-            # WA_UnderMouse périmé à True, et chaque tick occupé rafraîchit
-            # l'échéance — les deux barres par œil ne disparaissaient JAMAIS.
-            # Un survol réel continue d'épingler la barre : ses événements
-            # Enter/MouseMove passent par l'eventFilter → _mark_activity().
-            if not hud_active and self.controls_overlay.underMouse():
-                return True
-                
+            # Hover alone is not interaction. A stationary pointer over the
+            # controls must still let the idle deadline expire; real movement
+            # refreshes it through the event filter and the global poller.
             for combo in (self.controls_overlay.audio_track_combo,
                           self.controls_overlay.subtitle_track_combo,
                           self.controls_overlay.stereo_mode_combo):
@@ -239,6 +233,7 @@ class WindowPresentationMixin:
             self.controls_overlay.setWindowOpacity(1.0)
             
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.video_widget.setCursor(Qt.CursorShape.ArrowCursor)
 
         # V14b RENDER HEARTBEAT: Stop heartbeat when controls are visible (UI activity is sufficient)
         if self._render_heartbeat_timer.isActive():
@@ -264,15 +259,10 @@ class WindowPresentationMixin:
             hud.set_desired_visible(False)
             
         if hud is None or not hud.active:
-            if self._nav_is_fullscreen():
-                from PySide6.QtWidgets import QGraphicsOpacityEffect
-                opacity_effect = self.controls_overlay.graphicsEffect()
-                if not opacity_effect:
-                    opacity_effect = QGraphicsOpacityEffect(self.controls_overlay)
-                    self.controls_overlay.setGraphicsEffect(opacity_effect)
-                opacity_effect.setOpacity(0.0)
-            else:
-                self.controls_overlay.setWindowOpacity(0.0)
+            # A child QWidget's windowOpacity is not a dependable way to hide
+            # it on macOS, especially above a QOpenGLWidget. Actual visibility
+            # also prevents invisible controls from keeping a hover cursor.
+            self.controls_overlay.hide()
         else:
             # HUD actif : On efface la texture 3D du projecteur (et des autres écrans)
             for w in self._display_widgets():
@@ -288,6 +278,7 @@ class WindowPresentationMixin:
 
         # La souris disparaît de l'écran principal
         self.setCursor(Qt.CursorShape.BlankCursor)
+        self.video_widget.setCursor(Qt.CursorShape.BlankCursor)
 
         if (self._nav_is_fullscreen() and not self._render_heartbeat_timer.isActive()
                 and not self.mvc_mode_active and not getattr(self, '_hevc_mode_active', False)):
@@ -335,7 +326,11 @@ class WindowPresentationMixin:
             else:
                 self.showFullScreen()
                 self._is_fake_fullscreen = True
-            self._on_fullscreen_resized()
+            self.controls_overlay.set_fullscreen_icon(self._is_fake_fullscreen)
+            self._update_overlays_geometry()
+            if self.has_media:
+                self.show_controls()
+            QTimer.singleShot(50, self._refresh_nav_after_window_transition)
             return
 
         import ctypes
@@ -909,6 +904,12 @@ class WindowPresentationMixin:
             event.accept()
             return
 
+        # 'F' -> Toggle Fullscreen
+        if key == Qt.Key.Key_F:
+            self.toggle_fullscreen()
+            event.accept()
+            return
+
         # Escape -> Exit Fullscreen
         if key == Qt.Key.Key_Escape:
             if self._is_fake_fullscreen:
@@ -941,7 +942,25 @@ class WindowPresentationMixin:
 
         super().keyPressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        """Double clicking on the window or video toggles fullscreen."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_fullscreen()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def eventFilter(self, watched, event):
+        # Handle video_widget double-clicks and mouse movement
+        if watched is getattr(self, 'video_widget', None):
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.toggle_fullscreen()
+                    return True
+            elif event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
+                if self.has_media:
+                    self._mark_activity()
+
         # V15: Handle combo popup visibility changes
         if watched.property("is_combo_popup") and event.type() == QEvent.Type.Hide:
             self._on_combo_popup_closed()

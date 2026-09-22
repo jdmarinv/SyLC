@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 import time
 import traceback
 
@@ -723,10 +724,6 @@ class MediaLoadingMixin:
             # point every observer belongs to this exact core/session pair.
             self._mpv_transition_in_progress = False
             self.player.play(_mpv_src)
-            if sys.platform == 'darwin':
-                from sylc.macos_mpv_embed import reparent_macos_mpv_view
-                self._media_single_shot(150, lambda: reparent_macos_mpv_view(self.video_widget), owner)
-                self._media_single_shot(400, lambda: reparent_macos_mpv_view(self.video_widget), owner)
             # A new playlist entry may run mpv's track selection again. Keep
             # every subtitle backend neutral until the remembered/user choice
             # is explicitly applied after track enumeration.
@@ -903,7 +900,7 @@ class MediaLoadingMixin:
             self.has_media = False
             self._abort_media_load(owner, f"Playback initialization failed: {exc}")
             try:
-                self.loading_overlay.hide_loading()
+                self.loading_overlay.hide_loading(immediate=True)
             except Exception:
                 pass
         finally:
