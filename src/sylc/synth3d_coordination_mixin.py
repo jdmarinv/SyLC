@@ -1378,14 +1378,21 @@ class Synth3DCoordinationMixin:
                     "onnxruntime.dll is missing from this install — "
                     "downloading depth models will not enable this")
             elif reason == 'renderer':
-                act.setToolTip(
-                    "The native renderer is not available in this build")
+                if sys.platform == 'darwin':
+                    act.setToolTip(
+                        "2D->3D AI depth synthesis is currently Windows-only (requires Direct3D 11 & TensorRT)")
+                else:
+                    act.setToolTip(
+                        "The native renderer is not available in this build")
             else:
                 act.setToolTip(
                     "Depth models are not installed — use “Depth models” at "
                     "the top of this menu to download them")
         elif not eligible and not self._synth3d_active:
-            act.setToolTip("Available on 2D video decoded by the native pipeline")
+            if self._content_is_3d():
+                act.setToolTip("This video is already in 3D format — 2D->3D synthesis only applies to 2D videos")
+            else:
+                act.setToolTip("Available on 2D video decoded by the native pipeline")
         else:
             act.setToolTip("Synthesize stereo 3D from this 2D video")
         act.blockSignals(False)

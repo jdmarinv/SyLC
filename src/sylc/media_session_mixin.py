@@ -379,6 +379,8 @@ class MediaSessionMixin:
                 'vo': 'gpu-next',
                 'gpu-api': 'vulkan',
                 'hwdec': 'videotoolbox',
+                'macos-app-activation-policy': 'accessory',
+                'border': 'no',
             })
 
         # A core detached by Stop may still be cooling toward its deferred

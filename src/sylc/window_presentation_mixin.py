@@ -123,6 +123,8 @@ class WindowPresentationMixin:
         other app — 'the player keeps putting itself on top every few seconds'.
         WindowFromPoint sees the real stacking; GetCursorPos gives physical
         pixels so no DPI conversion of QCursor.pos() is needed."""
+        if sys.platform != 'win32':
+            return True
         try:
             import ctypes
             from ctypes import wintypes
