@@ -347,9 +347,16 @@ class ModelDownloadDialog(QDialog):
         """
         import sys
         if sys.platform == 'darwin':
-            gpu_info = trt_runtime.detect_gpu()
-            self._trt_label.setText(f"Hardware Acceleration — {gpu_info.name if gpu_info else 'Apple Silicon Metal'} (Native Active)")
-            self._trt_label.setEnabled(True)
+            try:
+                import onnxruntime as ort
+                providers = ort.get_available_providers()
+                prov = "CoreML / Neural Engine" if "CoreMLExecutionProvider" in providers else "CPU"
+                self._trt_label.setText(f"AI Depth Engine — Apple Silicon ({prov} Active)")
+                self._trt_label.setEnabled(True)
+            except Exception:
+                self._trt_label.setText(
+                    "AI Depth Engine — onnxruntime missing (run: pip install onnxruntime --break-system-packages)")
+                self._trt_label.setEnabled(False)
             self._trt_button.setVisible(False)
             self._discard_button.setVisible(False)
             return

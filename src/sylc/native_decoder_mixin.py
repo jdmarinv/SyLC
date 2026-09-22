@@ -77,6 +77,22 @@ class NativeDecoderMixin:
         # directions, so calling it unconditionally here is safe.
         self._set_dual_projector_enabled(enable_3d and stereo_mode == 'dual')
 
+        if sys.platform == 'darwin' and getattr(self, '_synth3d_active', False) and enable_3d:
+            if hasattr(self, 'video_widget') and self.video_widget:
+                self.video_widget.stereo_mode = stereo_mode
+                self.video_widget.synth3d_enabled = True
+                if hasattr(self.video_widget, 'update'):
+                    self.video_widget.update()
+            mode_name = {
+                'sbs': "Side-by-Side",
+                'tab': "Top-Bottom",
+                'glasses': "Glasses (F-SBS)",
+                'anaglyph': "Anaglyph (Red-Cyan)",
+                'mvc': "MultiView / Anaglyph",
+            }.get(stereo_mode, "3D")
+            self.show_3d_notification(f"2D->3D: {mode_name}", success=True)
+            return
+
         if not self.player: return
 
         if not enable_3d:

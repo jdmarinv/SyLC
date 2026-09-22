@@ -219,8 +219,22 @@ def runtime_status(ort_dir, model_path=None):
     import sys
     if sys.platform == 'darwin':
         gpu = detect_gpu()
-        gpu_name = gpu.name if gpu else "Apple Silicon (Metal / VideoToolbox)"
-        return Status(READY, f"{gpu_name} (Active)", gpu)
+        try:
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            prov_str = "CoreML" if "CoreMLExecutionProvider" in providers else "CPU"
+            gpu_name = gpu.name if gpu else "Apple Silicon"
+            return Status(
+                READY,
+                f"{gpu_name} ({prov_str} Active)",
+                gpu,
+            )
+        except Exception:
+            return Status(
+                NOT_INSTALLED,
+                "onnxruntime is not installed; run: pip install onnxruntime --break-system-packages",
+                gpu,
+            )
 
     gpu = detect_gpu()
     if gpu is None:

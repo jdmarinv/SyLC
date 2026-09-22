@@ -1548,8 +1548,11 @@ class PlayerWindow(
         seen = set()
         windows = (getattr(self, 'framepacking_window', None),
                    *(getattr(self, 'eye_windows', None) or ()))
-        for widget in (getattr(self, 'mvc_embedded_widget', None),
-                       *(getattr(w, 'display_widget', None) for w in windows)):
+        candidates = [getattr(self, 'mvc_embedded_widget', None),
+                      *(getattr(w, 'display_widget', None) for w in windows)]
+        if sys.platform == 'darwin':
+            candidates.insert(0, getattr(self, 'video_widget', None))
+        for widget in candidates:
             if widget is None or id(widget) in seen:
                 continue
             seen.add(id(widget))

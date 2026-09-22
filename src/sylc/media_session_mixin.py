@@ -148,7 +148,9 @@ class MediaSessionMixin:
         self._remove_mpv_media_observers(dying)
         self._remove_mpv_subtext_observer(dying)
         if sys.platform == 'darwin':
-            self.video_widget.detach_player()
+            vw = getattr(self, 'video_widget', None)
+            if vw is not None and hasattr(vw, 'detach_player'):
+                vw.detach_player()
         self._mpv_dying = dying
         try:
             dying.command('stop')
