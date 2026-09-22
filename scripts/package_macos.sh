@@ -18,21 +18,21 @@ codesign --verify --deep --strict "$APP"
 STAGE_DIR="$(mktemp -d "$BUILD_DIR/dmg.XXXXXX")"
 ditto "$APP" "$STAGE_DIR/SyLC 3D Player.app"
 ln -s /Applications "$STAGE_DIR/Applications"
-cat > "$STAGE_DIR/LEEME.txt" <<'EOF'
+cat > "$STAGE_DIR/README.txt" <<'EOF'
 SyLC 3D Player — macOS Apple Silicon
 
-Arrastra SyLC 3D Player a Applications.
-Incluye Python, libmpv, FFmpeg y el modelo Small 518 para 2D→3D.
-Esta compilación tiene firma local y no está notarizada por Apple.
-Si macOS bloquea la apertura, usa Ajustes del Sistema > Privacidad y seguridad
-> Abrir igualmente, después de intentar abrir la aplicación.
+Drag SyLC 3D Player to Applications.
+Includes Python, libmpv, FFmpeg, and the Small 518 model for 2D-to-3D conversion.
+This build is ad hoc signed and has not been notarized by Apple.
+If macOS blocks the app, try opening it, then go to System Settings >
+Privacy & Security > Open Anyway.
 
-La inferencia 2D→3D en este Mac produce aproximadamente 0,8 mapas/s.
-No se ha ejecutado el reproductor como prueba de este paquete.
+Observed depth inference on an Apple M3 Pro: approximately 0.8 depth maps/s.
+The packaged player has not been launched for functional testing.
 EOF
 DMG="$DIST_DIR/SyLC-7.0.0-macOS-arm64.dmg"
 hdiutil create -ov -volname 'SyLC 3D Player' -srcfolder "$STAGE_DIR" \
     -format UDZO "$DMG"
 hdiutil verify "$DMG"
-shasum -a 256 "$DMG" > "$DMG.sha256"
+(cd "$DIST_DIR" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
 echo "Release: $DMG"
