@@ -136,6 +136,8 @@ def sylc_models_download_dir():
     """Where the in-app downloader writes: next to the executable when that is
     writable, otherwise the per-user directory. Both are searched by
     _synth3d_models_dirs(), so either choice resolves afterwards."""
+    if sys.platform == 'darwin' and getattr(sys, 'frozen', False):
+        return os.path.join(sylc_user_data_dir(), 'models')
     beside_exe = os.path.join(
         os.path.dirname(os.path.abspath(sys.argv[0])), 'models')
     try:

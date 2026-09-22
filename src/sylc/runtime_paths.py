@@ -22,7 +22,7 @@ def _unique_existing(paths):
 
 
 def _application_roots():
-    candidates = [os.environ.get('SYLC_PROJECT_ROOT')]
+    candidates = [os.environ.get('SYLC_PROJECT_ROOT'), getattr(sys, '_MEIPASS', None)]
     try:
         import __compiled__
         candidates.append(getattr(__compiled__, 'containing_dir', None))
