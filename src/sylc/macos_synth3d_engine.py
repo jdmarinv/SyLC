@@ -57,6 +57,7 @@ class MacOSSynth3DEngine:
         self._ema_depth: Optional[np.ndarray] = None
         self._tone_lo: Optional[float] = None
         self._tone_hi: Optional[float] = None
+        self._previous_input_time: Optional[float] = None
 
         # Diagnostics & Metrics
         self._infer_count: int = 0
@@ -94,6 +95,7 @@ class MacOSSynth3DEngine:
             self._ema_depth = None
             self._tone_lo = None
             self._tone_hi = None
+            self._previous_input_time = None
             self._error_message = None
 
             self._worker_thread = threading.Thread(
@@ -175,7 +177,7 @@ class MacOSSynth3DEngine:
         arr = np.frombuffer(ptr, dtype=np.uint8).reshape((h, w, 4))
         # Keep RGB channels
         rgb = np.ascontiguousarray(arr[:, :, :3])
-        return self.submit_frame(rgb, pts)
+        return self.submit_frame(rgb, time.monotonic())
 
     def get_latest_depth(self) -> Optional[Tuple[bytes, int, int]]:
         """Retrieve the latest stabilized depth map as packed RGBA bytes (width, height).
@@ -377,8 +379,17 @@ class MacOSSynth3DEngine:
         # 6. Robust percentile tone mapping (2nd & 98th percentile)
         p2, p98 = np.percentile(inv_depth, [2.0, 98.0])
 
-        # Temporal tone smoothing
-        if self._tone_lo is None or self._tone_hi is None:
+        # Pixel-wise EMA assumes consecutive, aligned frames. At the observed
+        # ~0.8 depth fps, the previous map can belong to another shot or object
+        # position. Do not mix it into a new map or retain its tone scale.
+        consecutive = (self._previous_input_time is not None
+                       and 0.0 < pts - self._previous_input_time <= 0.25)
+        self._previous_input_time = pts
+        if not consecutive:
+            self._ema_depth = None
+
+        # Temporal tone smoothing only for closely spaced input frames.
+        if not consecutive or self._tone_lo is None or self._tone_hi is None:
             self._tone_lo = float(p2)
             self._tone_hi = float(p98)
         else:

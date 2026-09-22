@@ -388,9 +388,11 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
             return True
 
         # Try modern Core profile shader (macOS Core Profile 3.2+), fallback to legacy GLSL 120
-        program = self._compile_shader_pair(VERTEX_SHADER_CORE, FRAGMENT_SHADER_CORE)
+        modern_gl = self.context().format().majorVersion() >= 3
+        program = (self._compile_shader_pair(VERTEX_SHADER_CORE, FRAGMENT_SHADER_CORE)
+                   if modern_gl else None)
         if program is None:
-            logger.info("[2D3D macOS] Core profile shader failed, trying legacy GLSL 120...")
+            logger.info("[2D3D macOS] Using compatibility GLSL 120 shader")
             program = self._compile_shader_pair(VERTEX_SHADER_LEGACY, FRAGMENT_SHADER_LEGACY)
         if program is None:
             logger.error("[2D3D macOS] Failed to compile and link shader program")
@@ -525,6 +527,8 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
             # 4. Asynchronously send downscaled frame probe to depth inference worker
             if self._engine.is_ready_for_frame():
                 try:
+                    # The scissor left by mpv also affects framebuffer blits.
+                    self.context().functions().glDisable(GL_SCISSOR_TEST)
                     QOpenGLFramebufferObject.blitFramebuffer(self._probe_fbo, self._source_fbo)
                     probe_img = self._probe_fbo.toImage()
                     self._engine.submit_qimage(probe_img)
@@ -539,17 +543,33 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
             depth_data = self._engine.get_latest_depth()
             if depth_data is not None:
                 packed_bytes, dw, dh = depth_data
-                depth_img = QImage(packed_bytes, dw, dh, dw * 4, QImage.Format.Format_RGBA8888).copy()
+                # toImage() gave the model top-down raster rows. Restore GL's
+                # bottom-up row order so depth and the source FBO share UVs.
+                depth_pixels = np.ascontiguousarray(
+                    np.frombuffer(packed_bytes, dtype=np.uint8)
+                    .reshape(dh, dw, 4)[::-1])
                 if (self._depth_texture is None or self._depth_texture.width() != dw
                         or self._depth_texture.height() != dh):
                     if self._depth_texture is not None:
                         self._depth_texture.destroy()
-                    self._depth_texture = QOpenGLTexture(depth_img)
+                    self._depth_texture = QOpenGLTexture(QOpenGLTexture.Target.Target2D)
+                    self._depth_texture.setFormat(QOpenGLTexture.TextureFormat.RGBA8_UNorm)
+                    self._depth_texture.setSize(dw, dh)
+                    self._depth_texture.setMipLevels(1)
+                    self._depth_texture.allocateStorage(
+                        QOpenGLTexture.PixelFormat.RGBA, QOpenGLTexture.PixelType.UInt8)
+                    # Decoding RG16 is a linear weighted sum, so filtering
+                    # channels before decoding correctly interpolates depth.
                     self._depth_texture.setMinMagFilters(
-                        QOpenGLTexture.Filter.Nearest, QOpenGLTexture.Filter.Nearest)
+                        QOpenGLTexture.Filter.Linear, QOpenGLTexture.Filter.Linear)
                     self._depth_texture.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-                else:
-                    self._depth_texture.setData(depth_img)
+                # The QImage overload allocates storage again on every update.
+                # Upload pixels into the existing allocation instead. Keep the
+                # owning array alive until this synchronous transfer returns.
+                self._depth_texture.setData(
+                    QOpenGLTexture.PixelFormat.RGBA,
+                    QOpenGLTexture.PixelType.UInt8,
+                    int(depth_pixels.ctypes.data))
                 self._depth_upload_count += 1
 
             # 6. Render DIBR stereo warped output to Qt's default framebuffer
@@ -580,7 +600,11 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
                 }
                 logger.info("[2D3D macOS] Shader interface attributes=%s uniforms=%s",
                             attributes, uniforms)
+                if any(location < 0 for location in uniforms.values()):
+                    raise RuntimeError("Missing required stereo shader uniform")
+                self._uniform_locations = uniforms
                 self._shader_interface_logged = True
+            locations = self._uniform_locations
             if self._vao is not None:
                 self._vao.bind()
             else:
@@ -593,7 +617,7 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
             # Texture 0: Source frame
             funcs.glActiveTexture(GL_TEXTURE0)
             funcs.glBindTexture(GL_TEXTURE_2D, self._source_fbo.texture())
-            self._shader_program.setUniformValue("u_source_tex", 0)
+            funcs.glUniform1i(locations["u_source_tex"], 0)
 
             # Texture 1: Depth map
             funcs.glActiveTexture(GL_TEXTURE1)
@@ -601,14 +625,18 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
                 funcs.glBindTexture(GL_TEXTURE_2D, self._depth_texture.textureId())
             else:
                 funcs.glBindTexture(GL_TEXTURE_2D, 0)
-            self._shader_program.setUniformValue("u_depth_tex", 1)
+            funcs.glUniform1i(locations["u_depth_tex"], 1)
 
             # Strength & convergence parameters
             has_depth = self._depth_texture is not None
             strength_val = float(self.synth3d_strength * 0.01) if has_depth else 0.0
-            self._shader_program.setUniformValue("u_strength", strength_val)
-            self._shader_program.setUniformValue("u_convergence", float(self.synth3d_convergence))
-            self._shader_program.setUniformValue("u_depth_view", 1 if (self.synth3d_depth_view and has_depth) else 0)
+            # Use numeric locations and explicitly typed GL entry points.
+            # The installed PySide6 named scalar wrappers reject byte names.
+            funcs.glUniform1f(locations["u_strength"], strength_val)
+            funcs.glUniform1f(
+                locations["u_convergence"], float(self.synth3d_convergence))
+            funcs.glUniform1i(
+                locations["u_depth_view"], 1 if (self.synth3d_depth_view and has_depth) else 0)
 
             # Stereo presentation mode mapping
             # 0: Anaglyph Red-Cyan, 1: Side-by-Side, 2: Top-and-Bottom, 3: MultiView/Mono
@@ -623,7 +651,7 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
             else:
                 mode_int = 3
 
-            self._shader_program.setUniformValue("u_stereo_mode", mode_int)
+            funcs.glUniform1i(locations["u_stereo_mode"], mode_int)
 
             # Draw fullscreen quad
             funcs.glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
@@ -636,6 +664,20 @@ class MacOSMpvVideoWidget(QOpenGLWidget):
 
         except Exception:
             logger.exception("[2D3D macOS] Error in paintGL stereo rendering")
+            # Preserve the frame already rendered by mpv if stereo composition
+            # fails. Do not request a second mpv render for the same frame.
+            try:
+                funcs = self.context().functions()
+                funcs.glUseProgram(0)
+                if self._vao is not None:
+                    self._vao.release()
+                funcs.glDisable(GL_SCISSOR_TEST)
+                if self._source_fbo is not None and self._source_fbo.isValid():
+                    funcs.glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
+                    # Qt resolves a null target to this widget's default FBO.
+                    QOpenGLFramebufferObject.blitFramebuffer(None, self._source_fbo)
+            except Exception:
+                logger.exception("[2D3D macOS] Failed to recover the source frame")
         finally:
             if render_attempted:
                 try:
