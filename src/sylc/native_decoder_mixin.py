@@ -7,6 +7,8 @@ import logging
 import os
 import time
 import traceback
+import sys
+
 
 import numpy as np
 from PySide6.QtCore import QTimer, Qt, Slot
@@ -139,7 +141,8 @@ class NativeDecoderMixin:
                         and _pext in EDGE264_CONTAINERS)
 
         # Use the edge264 decoder for MVC content (any output) AND packed-stereo H.264.
-        use_mvc_decoder = (MVC_SUPPORT_AVAILABLE and self.current_file_path and
+        # On macOS, native D3D11 rendering is unavailable, so MPV handles playback in the main window.
+        use_mvc_decoder = (MVC_SUPPORT_AVAILABLE and NATIVE_RENDER_AVAILABLE and self.current_file_path and
                            (self.video_3d_info.get('stereo_mode') == 'mvc' or
                             self.video_3d_info.get('has_mvc_track') or
                             packed_input or
@@ -637,17 +640,24 @@ class NativeDecoderMixin:
         if getattr(self, 'video_widget', None) is not None:
             self.video_stack.setCurrentWidget(self.video_widget)
         try:
-            if not self.player: return
+            if self.player is None: return
             if sys.platform == 'darwin':
                 self.player['hwdec'] = 'videotoolbox'
+                self.player['video-sync'] = 'audio'
+                self.player['interpolation'] = 'no'
+                if getattr(self, 'video_widget', None) is not None:
+                    try:
+                        self.player['wid'] = str(int(self.video_widget.winId()))
+                    except Exception:
+                        pass
             else:
                 self.player['hwdec'] = 'no'
                 self.player['vf'] = 'scale=1920:2205'
-            self.player['override-display-fps'] = self._get_effective_video_fps()
-            try:
-                self.player['video-sync'] = 'display-resample'
-            except Exception:
-                pass
+                self.player['override-display-fps'] = self._get_effective_video_fps()
+                try:
+                    self.player['video-sync'] = 'display-resample'
+                except Exception:
+                    pass
             self.show_3d_notification("3D MVC mode (mpv fallback)", success=True)
         except Exception:
             pass
@@ -1495,6 +1505,8 @@ class NativeDecoderMixin:
 
     def _show_framepacking_output(self):
         """Show the detached 3D output without stealing the main UI's focus."""
+        if sys.platform != 'win32' or not NATIVE_RENDER_AVAILABLE:
+            return
         fp = getattr(self, 'framepacking_window', None)
         if fp is None:
             return
@@ -1702,7 +1714,7 @@ class NativeDecoderMixin:
 
     def _restore_mpv_video_output(self):
         """Restore mpv video output after MVC playback failures/stop."""
-        if not self.player:
+        if self.player is None:
             return
         try:
             # Restore video output backend (D3D11) if we saved it.
@@ -1737,12 +1749,17 @@ class NativeDecoderMixin:
             if sys.platform == 'darwin':
                 try:
                     self.player['hwdec'] = 'videotoolbox'
+                    self.player['video-sync'] = 'audio'
+                    self.player['interpolation'] = 'no'
+                    if getattr(self, 'video_widget', None) is not None:
+                        self.player['wid'] = str(int(self.video_widget.winId()))
                 except Exception:
                     pass
-            try:
-                self.player['video-sync'] = 'display-resample'
-            except Exception:
-                pass
+            else:
+                try:
+                    self.player['video-sync'] = 'display-resample'
+                except Exception:
+                    pass
         except Exception:
             pass
 

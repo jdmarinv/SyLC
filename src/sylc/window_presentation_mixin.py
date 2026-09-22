@@ -302,6 +302,10 @@ class WindowPresentationMixin:
         When UI elements are hidden, Windows DWM may reduce compositor activity.
         Force window-level operations to keep the compositor active.
         """
+        # Windows DWM only: on macOS/Linux Cocoa/Wayland, calling repaint() 120Hz starves rendering.
+        if sys.platform != 'win32':
+            return
+
         # V7b++ STUTTER FIX: Skip in MVC mode - D3D11 widget handles its own rendering
         # The heartbeat was designed for MPV rendering, not for MVC/D3D11 mode.
         # GUI-HOG FIX (2026-07): the HEVC path also drives the native D3D11 renderer and

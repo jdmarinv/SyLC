@@ -262,7 +262,6 @@ class MediaSessionMixin:
             'wid': win_id,
             # === VIDEO OUTPUT ===
             'vo': 'gpu-next',
-            'hwdec': 'auto-copy' if sys.platform == 'win32' else 'auto',
 
             # === HDR PASSTHROUGH CONFIGURATION ===
             'target-colorspace-hint': 'yes',
@@ -277,26 +276,53 @@ class MediaSessionMixin:
             'dither-depth': 'auto',
             # Ensure proper GPU processing for HDR
             'gpu-dumb-mode': 'no',
+        }
 
-            # === FRAME TIMING - Smooth Playback ===
-            # display-resample syncs video to display refresh rate
-            'video-sync': 'display-resample',
-            'interpolation': 'yes',                 # Enable for smoother motion
-            'tscale': 'oversample',                 # Fast temporal scaling
-            'interpolation-threshold': 0.0001,     # Lower = more interpolation
+        if sys.platform == 'win32':
+            # === WINDOWS / RTX 4090 OPTIMIZATIONS ===
+            mpv_config.update({
+                'hwdec': 'auto-copy',
+                'video-sync': 'display-resample',
+                'interpolation': 'yes',
+                'tscale': 'oversample',
+                'interpolation-threshold': 0.0001,
+                'scale': 'ewa_lanczossharp',
+                'dscale': 'mitchell',
+                'cscale': 'ewa_lanczossoft',
+                'correct-downscaling': 'yes',
+                'linear-downscaling': 'yes',
+                'sigmoid-upscaling': 'yes',
+                'deband': 'yes',
+                'deband-iterations': 2,
+                'deband-threshold': 35,
+                'temporal-dither': 'yes',
+            })
+        elif sys.platform == 'darwin':
+            # === MACOS / APPLE SILICON METAL & VIDEOTOOLBOX ===
+            # Smooth playback on 60Hz/120Hz ProMotion displays without shader stutter
+            mpv_config.update({
+                'hwdec': 'videotoolbox',
+                'video-sync': 'audio',
+                'interpolation': 'no',
+                'scale': 'spline36',
+                'dscale': 'mitchell',
+                'cscale': 'bilinear',
+                'deband': 'no',
+                'correct-downscaling': 'yes',
+                'linear-downscaling': 'yes',
+                'sigmoid-upscaling': 'no',
+            })
+        else:
+            mpv_config.update({
+                'hwdec': 'auto',
+                'video-sync': 'audio',
+                'interpolation': 'no',
+                'scale': 'spline36',
+                'cscale': 'bilinear',
+                'deband': 'no',
+            })
 
-            # === RTX 4090 OPTIMIZATIONS ===
-            # High-quality scaling for powerful GPUs
-            'scale': 'ewa_lanczossharp',           # Best quality upscaling
-            'dscale': 'mitchell',                   # Good downscaling
-            'cscale': 'ewa_lanczossoft',           # Chroma upscaling
-            'correct-downscaling': 'yes',           # Correct downscaling in linear light
-            'linear-downscaling': 'yes',            # Linear light downscaling (HDR correct)
-            'sigmoid-upscaling': 'yes',             # Better upscaling quality
-            'deband': 'yes',                        # Remove banding artifacts
-            'deband-iterations': 2,                 # Fast debanding
-            'deband-threshold': 35,                 # Moderate threshold
-            'temporal-dither': 'yes',               # Reduce dithering flicker
+        mpv_config.update({
 
             # === CACHING & BUFFERING ===
             'input-default-bindings': True,
@@ -334,7 +360,7 @@ class MediaSessionMixin:
             'sid': 'no',
             'blend-subtitles': 'video',
             'gpu-shader-cache': 'yes',
-        }
+        })
 
         if sys.platform == 'win32':
             mpv_config.update({
