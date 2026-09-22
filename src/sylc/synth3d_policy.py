@@ -243,7 +243,8 @@ def synth3d_marker_attests(marker, model_path):
         return True
     if not probed:
         return True
-    return os.path.basename(model_path).lower() in {n.lower() for n in probed}
+    clean_path = str(model_path).replace('\\', '/')
+    return os.path.basename(clean_path).lower() in {n.lower() for n in probed}
 
 
 __all__ = [

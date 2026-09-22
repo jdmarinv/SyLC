@@ -423,7 +423,28 @@ def _find_asset(name):
             p = os.path.join(folder, name)
             if os.path.exists(p):
                 return p
-    return None
+# macOS: ensure ctypes find_library finds Homebrew or runtime libmpv quickly
+if sys.platform == 'darwin':
+    import ctypes.util
+    _orig_find_library = ctypes.util.find_library
+    def _mac_find_library(name):
+        search_prefixes = [
+            os.environ.get('SYLC_RUNTIME_DIR', ''),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runtime'),
+            os.path.join(os.getcwd(), 'runtime'),
+            '/opt/homebrew/lib',
+            '/usr/local/lib',
+        ]
+        for prefix in search_prefixes:
+            if not prefix or not os.path.isdir(prefix):
+                continue
+            for ext in ('.dylib', '.2.dylib', '.1.dylib', '.so'):
+                cand = os.path.join(prefix, f"lib{name}{ext}")
+                if os.path.isfile(cand):
+                    return cand
+        return _orig_find_library(name)
+    ctypes.util.find_library = _mac_find_library
+
 import mpv
 import numpy as np
 from sylc.premium_controls_overlay import PremiumControlsOverlay as ControlsOverlay

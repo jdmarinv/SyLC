@@ -34,12 +34,16 @@ class PlayerMemoryMixin:
         if not path:
             return None
         try:
-            drive = os.path.splitdrive(os.path.abspath(path))[0][:1].upper()
+            path_str = str(path)
+            if len(path_str) >= 2 and path_str[1] == ':' and path_str[0].isalpha():
+                drive = path_str[0].upper()
+            else:
+                drive = os.path.splitdrive(os.path.abspath(path))[0][:1].upper()
             for m in (getattr(self, '_active_iso_mount', None),
                       getattr(self, '_pending_iso_mount', None)):
                 if not m:
                     continue
-                letter = str(m[1] or '').rstrip('\\').rstrip(':')[:1].upper()
+                letter = str(m[1] or '').rstrip('\\/').rstrip(':')[:1].upper()
                 if letter and drive == letter:
                     return m[0]
         except Exception:

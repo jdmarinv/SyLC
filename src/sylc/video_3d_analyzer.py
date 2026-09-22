@@ -49,6 +49,13 @@ def _resolve_external_tool(executable_name):
         if resolved:
             return resolved
 
+    # PRIORITY 3: Common platform search paths (e.g. Homebrew on macOS)
+    if sys.platform == 'darwin':
+        for prefix in ('/opt/homebrew/bin', '/usr/local/bin'):
+            p = os.path.join(prefix, executable_name)
+            if os.path.isfile(p):
+                return p
+
     return None
 
 

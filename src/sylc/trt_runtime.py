@@ -130,6 +130,17 @@ def detect_gpu():
     # called from the "Depth models…" dialog's CONSTRUCTOR. An exception
     # escaping here would take that whole dialog down, including the model
     # downloads, which have nothing to do with TensorRT.
+    import sys
+    if sys.platform == 'darwin':
+        try:
+            import subprocess
+            out = subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip()
+            if not out:
+                out = "Apple Silicon"
+            return GpuInfo(name=f"{out} (Metal / VideoToolbox)", sm=999)
+        except Exception:
+            return GpuInfo(name="Apple Silicon (Metal / VideoToolbox)", sm=999)
+
     try:
         # WinDLL, not CDLL: the CUDA driver API is stdcall on 32-bit Windows.
         driver = ctypes.WinDLL("nvcuda.dll")
@@ -205,6 +216,12 @@ def runtime_status(ort_dir, model_path=None):
     presence and freshness only -- the round-3 behaviour that
     `_synth3d_ort_dir(None)` still has.
     """
+    import sys
+    if sys.platform == 'darwin':
+        gpu = detect_gpu()
+        gpu_name = gpu.name if gpu else "Apple Silicon (Metal / VideoToolbox)"
+        return Status(READY, f"{gpu_name} (Active)", gpu)
+
     gpu = detect_gpu()
     if gpu is None:
         return Status(NO_GPU, "no NVIDIA GPU detected", None)

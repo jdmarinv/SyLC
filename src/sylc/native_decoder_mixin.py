@@ -634,11 +634,16 @@ class NativeDecoderMixin:
         if hasattr(self, '_synth3d_on_native_path_lost'):
             self._synth3d_on_native_path_lost()
         self._restore_mpv_video_output()
+        if getattr(self, 'video_widget', None) is not None:
+            self.video_stack.setCurrentWidget(self.video_widget)
         try:
             if not self.player: return
-            self.player['hwdec'] = 'no'
+            if sys.platform == 'darwin':
+                self.player['hwdec'] = 'videotoolbox'
+            else:
+                self.player['hwdec'] = 'no'
+                self.player['vf'] = 'scale=1920:2205'
             self.player['override-display-fps'] = self._get_effective_video_fps()
-            self.player['vf'] = 'scale=1920:2205'
             try:
                 self.player['video-sync'] = 'display-resample'
             except Exception:
@@ -1725,6 +1730,15 @@ class NativeDecoderMixin:
                         pass
 
             self.player['video'] = 'auto'
+            try:
+                self.player['vid'] = 'auto'
+            except Exception:
+                pass
+            if sys.platform == 'darwin':
+                try:
+                    self.player['hwdec'] = 'videotoolbox'
+                except Exception:
+                    pass
             try:
                 self.player['video-sync'] = 'display-resample'
             except Exception:

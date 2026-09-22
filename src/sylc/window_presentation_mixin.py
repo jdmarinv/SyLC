@@ -2,6 +2,7 @@
 """Window presentation, navigation visibility and Qt input coordination."""
 
 import logging
+import sys
 import time
 
 from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
@@ -319,12 +320,18 @@ class WindowPresentationMixin:
             QCoreApplication.processEvents()
 
     def toggle_fullscreen(self):
-        """Toggle fullscreen using Win32 API to preserve HDR and MPV connection.
+        """Toggle fullscreen using Win32 API to preserve HDR and MPV connection on Windows,
+        or native Qt fullscreen on non-Windows platforms."""
+        if sys.platform != 'win32':
+            if self.isFullScreen() or getattr(self, '_is_fake_fullscreen', False):
+                self.showNormal()
+                self._is_fake_fullscreen = False
+            else:
+                self.showFullScreen()
+                self._is_fake_fullscreen = True
+            self._on_fullscreen_resized()
+            return
 
-        CRITICAL: Qt's showFullScreen() triggers SDR mode on HDR displays.
-        CRITICAL: Qt's setWindowFlags() recreates window and breaks MPV.
-        Solution: Use Win32 API to modify window style without recreating it.
-        """
         import ctypes
         from ctypes import wintypes, byref, c_void_p, c_int, c_uint
 
@@ -376,7 +383,7 @@ class WindowPresentationMixin:
             self.controls_overlay.set_fullscreen_icon(False)
             
             # Optimize for windowed: disable flip model to reduce compositor stuttering
-            if self.player:
+            if self.player and sys.platform == 'win32':
                 try:
                     self.player['d3d11-flip'] = 'no'
                     logger.info("[HDR] Windowed: d3d11-flip=no for smooth playback")
@@ -451,7 +458,7 @@ class WindowPresentationMixin:
             self.controls_overlay.set_fullscreen_icon(True)
             
             # Optimize for fullscreen: flip model for best performance
-            if self.player:
+            if self.player and sys.platform == 'win32':
                 try:
                     self.player['d3d11-flip'] = 'yes'
                     logger.info("[HDR] Fullscreen: d3d11-flip=yes for optimal performance")
@@ -530,6 +537,8 @@ class WindowPresentationMixin:
 
     def _refresh_windows_hdr_brightness(self):
         """Force Windows to re-apply HDR SDR brightness setting via DisplayConfig API."""
+        if sys.platform != 'win32':
+            return
         try:
             import ctypes
             from ctypes import wintypes, Structure, byref, sizeof
@@ -620,7 +629,10 @@ class WindowPresentationMixin:
             logger.warning(f"[WINDOWED] Could not apply settings: {e}")
         
         # Refresh Windows HDR brightness after exiting fullscreen
-        QTimer.singleShot(200, self._refresh_windows_hdr_brightness)
+        if sys.platform == 'win32' or (hasattr(self, '_refresh_windows_hdr_brightness') and callable(getattr(self, '_refresh_windows_hdr_brightness', None))):
+            QTimer.singleShot(200, self._refresh_windows_hdr_brightness)
+        elif hasattr(self, '_refresh_windows_hdr_brightness'):
+            QTimer.singleShot(200, self._refresh_windows_hdr_brightness)
 
     def _enter_borderless_fullscreen_win32(self):
         """Enter borderless fullscreen using Win32 API directly.
@@ -629,6 +641,11 @@ class WindowPresentationMixin:
         breaking the MPV player connection. Instead, we modify the window style
         directly via Windows API.
         """
+        if sys.platform != 'win32':
+            self.showFullScreen()
+            self._is_fake_fullscreen = True
+            return
+
         import ctypes
         from ctypes import wintypes
         
@@ -697,6 +714,11 @@ class WindowPresentationMixin:
 
     def _exit_borderless_fullscreen_win32(self):
         """Exit borderless fullscreen using Win32 API directly."""
+        if sys.platform != 'win32':
+            self.showNormal()
+            self._is_fake_fullscreen = False
+            return
+
         import ctypes
         
         SWP_FRAMECHANGED = 0x0020

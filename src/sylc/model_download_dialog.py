@@ -345,6 +345,15 @@ class ModelDownloadDialog(QDialog):
         writes INTO that directory and the row has to follow it without a second
         mechanism.
         """
+        import sys
+        if sys.platform == 'darwin':
+            gpu_info = trt_runtime.detect_gpu()
+            self._trt_label.setText(f"Hardware Acceleration — {gpu_info.name if gpu_info else 'Apple Silicon Metal'} (Native Active)")
+            self._trt_label.setEnabled(True)
+            self._trt_button.setVisible(False)
+            self._discard_button.setVisible(False)
+            return
+
         status = trt_runtime.runtime_status(self._ort_dir)
         self._trt_label.setText(f"TensorRT — {status.message}")
         # Greyed only for the two verdicts the user can do nothing about. The

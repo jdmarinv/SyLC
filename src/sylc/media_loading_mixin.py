@@ -38,12 +38,12 @@ class MediaLoadingMixin:
         text = str(path or '').strip()
         if not text:
             return ''
-        normalized = os.path.normpath(text)
+        normalized = os.path.normpath(text.replace('\\', '/'))
         leaf = os.path.basename(normalized)
         if leaf.lower() == 'bdmv':
             leaf = os.path.basename(os.path.dirname(normalized))
         if not leaf:
-            drive = os.path.splitdrive(normalized)[0]
+            drive = os.path.splitdrive(text)[0]
             leaf = f"Blu-ray Disc ({drive})" if drive else normalized
         stem, extension = os.path.splitext(leaf)
         return stem if extension and stem else leaf

@@ -1,5 +1,5 @@
-"""Ownership and lifecycle of media sessions and the persistent mpv core."""
-
+import os
+import sys
 import logging
 import threading
 import time
@@ -260,21 +260,11 @@ class MediaSessionMixin:
 
         mpv_config = {
             'wid': win_id,
-            # === VIDEO OUTPUT - Optimized for HDR & Fullscreen ===
+            # === VIDEO OUTPUT ===
             'vo': 'gpu-next',
-            'gpu-api': 'd3d11',
-            'hwdec': 'auto-copy',
-
-            # === D3D11 FULLSCREEN PERFORMANCE ===
-            # Triple buffering for smooth fullscreen playback
-            'd3d11-flip': 'no',                     # Disable flip model for smooth windowed HDR
-            'd3d11-sync-interval': 1,               # VSync on (1 frame)
-            'swapchain-depth': 3,                   # Triple buffering
-            'd3d11-exclusive-fs': 'no',             # CRITICAL: Disable exclusive fullscreen to preserve HDR
+            'hwdec': 'auto-copy' if sys.platform == 'win32' else 'auto',
 
             # === HDR PASSTHROUGH CONFIGURATION ===
-            # Force PQ swapchain for HDR preservation
-            'd3d11-output-csp': 'pq',
             'target-colorspace-hint': 'yes',
             # Let MPV auto-detect HDR capabilities
             'target-trc': 'auto',
@@ -345,6 +335,25 @@ class MediaSessionMixin:
             'blend-subtitles': 'video',
             'gpu-shader-cache': 'yes',
         }
+
+        if sys.platform == 'win32':
+            mpv_config.update({
+                'gpu-api': 'd3d11',
+                'd3d11-flip': 'no',
+                'd3d11-sync-interval': 1,
+                'swapchain-depth': 3,
+                'd3d11-exclusive-fs': 'no',
+                'd3d11-output-csp': 'pq',
+            })
+        elif sys.platform == 'darwin':
+            vulkan_icd = '/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json'
+            if os.path.isfile(vulkan_icd):
+                os.environ['VK_ICD_FILENAMES'] = vulkan_icd
+            mpv_config.update({
+                'vo': 'gpu-next',
+                'gpu-api': 'vulkan',
+                'hwdec': 'videotoolbox',
+            })
 
         # A core detached by Stop may still be cooling toward its deferred
         # terminate. Two cores must never overlap on the same wid HWND —
